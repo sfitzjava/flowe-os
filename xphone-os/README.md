@@ -142,6 +142,27 @@ in `src/fonts/`.
 | Confirm (front) | open selected app | — |
 | Back (front) | — | return to launcher |
 
+### reTerminal Sticky controls
+
+The Sticky has no 4-button front row; its capacitive touchscreen replaces it,
+and its 2 physical buttons are the page keys:
+
+| Input | Action |
+|-------|--------|
+| UP (GPIO5) | `Btn::Up` — scroll up / page up (reader page turn) |
+| DOWN (GPIO6) | `Btn::Down` — scroll down / page down (reader page turn) |
+| OK (GPIO4), tap < 1.5 s | `Btn::Confirm` |
+| OK (GPIO4), hold 1.5–5 s | nap / wake |
+| OK (GPIO4), hold ≥ 5 s | off (deep sleep; GPIO4 wakes) |
+| OK (GPIO4), hold ≥ 10 s | restart |
+| Tap a soft-key tab | the tab's button (Back / Confirm / Left / Right) |
+| Tap-and-hold the Confirm tab | Confirm long-press (bookmark delete, clear-all) |
+| Swipe left / right | `Btn::Left` / `Btn::Right` (list scroll, reader page turn) |
+
+On the shared OK/power pin (GPIO4) a hold of 1.5 s or longer is a power
+gesture, never a Confirm; Confirm-long comes from a touch hold on the Confirm
+tab instead, so the two never collide.
+
 Known M1 limitation: input is not sampled during an e-ink refresh (single
 task, no async poll task yet), so presses landing mid-refresh are dropped.
 
@@ -180,14 +201,15 @@ the other OTA slot and hands over. To flash the same image again later, rename
 
 ## Envs
 
-Runtime X3/X4 detection is sidestepped: each env compiles exactly one
-`-DFREEINK_DEVICE_*`, so the right panel driver and geometry are fixed at
-build time.
+X3/X4 are runtime-detected into one ESP32-C3 binary (`pio run -e x3` / `-e x4`
+are aliases). The reTerminal Sticky is an ESP32-S3 — a different MCU family the
+SDK won't mix into the C3 image — so it is its own build, `-e sticky`.
 
-| env | device | panel | resolution |
-|-----|--------|-------|------------|
-| `x3` (default) | Xteink X3 | UC8253 | 792x528 |
-| `x4` | Xteink X4 | SSD1677 | 800x480 |
+| env | device | MCU | panel | resolution |
+|-----|--------|-----|-------|------------|
+| `x3` (default) | Xteink X3 | ESP32-C3 | UC8253 | 792x528 |
+| `x4` | Xteink X4 | ESP32-C3 | SSD1677 | 800x480 |
+| `sticky` | reTerminal Sticky | ESP32-S3R8 | SSD1677 | 800x480 |
 
 ## Build / flash
 
@@ -195,6 +217,7 @@ build time.
 pio run -e x3              # build X3
 pio run -e x3 -t upload    # flash X3
 pio run -e x4 -t upload    # flash X4
+pio run -e sticky -t upload # flash reTerminal Sticky (ESP32-S3)
 pio device monitor         # 115200 baud, boot report
 ```
 

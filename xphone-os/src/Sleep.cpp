@@ -540,11 +540,22 @@ void sleepNow(Gfx& gfx, Input& input) {
   // GPIO wake (x4-os HalPowerManager.cpp:70-77).
   Serial.end();
 
-  // 6. Pre-sleep routines from the original firmware (HalPowerManager.cpp:
-  //    79-86): GPIO13 drives the battery latch MOSFET and must be held low
-  //    during sleep — on battery the MCU is then completely powered off and
-  //    the power button hard-wires a power-up regardless of the wakeup
-  //    source below.
+  // 6. Pre-sleep power-rail handling, per board. Compile-time guard:
+  //    GPIO_NUM_45 does not exist in the C3 headers, and the X3/X4 GPIO13
+  //    latch block is meaningless on the Sticky — each side is dead code on
+  //    the other MCU, so pick at compile time, not runtime.
+#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+  // Sticky: keep the rail latched through deep sleep. GPIO45 holds the main
+  // power (see BoardSticky.cpp); it must keep its level while the chip sleeps
+  // or the rail drops mid-sleep. There is no GPIO13 latch on this board.
+  gpio_hold_en(GPIO_NUM_45);
+  gpio_deep_sleep_hold_en();
+#else
+  // X3/X4: pre-sleep routines from the original firmware (HalPowerManager.cpp:
+  // 79-86): GPIO13 drives the battery latch MOSFET and must be held low
+  // during sleep — on battery the MCU is then completely powered off and
+  // the power button hard-wires a power-up regardless of the wakeup
+  // source below.
   constexpr gpio_num_t kBatteryLatchPin = GPIO_NUM_13;
 #if XP_LIGHT_SLEEP_LIBS
   // P4 undo before DEEP sleep. Light sleep keeps every pad in its active
@@ -560,15 +571,23 @@ void sleepNow(Gfx& gfx, Input& input) {
   esp_sleep_config_gpio_isolate();
   gpio_deep_sleep_hold_en();
   gpio_hold_en(kBatteryLatchPin);
+#endif
 
   // 7. Arm the wakeup and go. ESP32-C3 has no ext0/ext1 — the deep-sleep
   //    "gpio" source takes a pin bitmask + level (active-low button =>
   //    ESP_GPIO_WAKEUP_GPIO_LOW; x4-os HalPowerManager.cpp:92, freeink-sdk
-  //    PowerManager.cpp:30). On USB power this is the only wake path, so log
-  //    a failure — sleeping regardless is still safe on battery (hard-wired
-  //    power-button latch above).
-  const esp_err_t wakeErr =
-      esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+  //    PowerManager.cpp:30). The Sticky's ESP32-S3 DOES have ext1, and the
+  //    C3-only esp_deep_sleep_enable_gpio_wakeup() does not exist there — use
+  //    ext1 (POWER_BUTTON_PIN is GPIO4, an RTC GPIO, active-low) on the S3.
+  //    On USB power this is the only wake path, so log a failure — sleeping
+  //    regardless is still safe on battery (hard-wired power-button latch).
+  //    Compile-time guard: the C3 API/enum are absent from the S3 headers.
+  esp_err_t wakeErr;
+#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+  wakeErr = esp_sleep_enable_ext1_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
+#else
+  wakeErr = esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+#endif
   if (wakeErr != ESP_OK) {
     // Serial is already down; nothing more we can report. Restart instead of
     // sleeping unwakeable-on-USB.

@@ -71,28 +71,42 @@ constexpr uint16_t kDmDesignCapacity = 0x929F;
 constexpr uint16_t kOpCfgUpdateMask = 0x0400;
 constexpr uint16_t kSecSealed = 0x3;  // 0b11 sealed, 0b10 unsealed, 0b01 full
 
+// The gauge's I2C controller (Wire or Wire1) per BoardConfig. On single-bus
+// SoCs (ESP32-C3, SOC_I2C_NUM == 1) Wire1 doesn't exist, so always use Wire.
+// Mirrors BatteryMonitor's gaugeWire() (SDK BatteryMonitor.cpp:28-33): on the
+// Sticky the GT911 touch owns Wire (SDA3/SCL2) and the gauge sits on Wire1
+// (SDA1/SCL0), so the two never fight over one controller.
+TwoWire& gaugeWire() {
+#if SOC_I2C_NUM > 1
+  if (BoardConfig::ACTIVE.batteryGauge.i2cBus == 1) return Wire1;
+#endif
+  return Wire;
+}
+
 // Returns the gauge I2C address (0 = none) with the bus brought up.
 // TwoWire::begin() is idempotent, so this is safe to call per operation.
 uint8_t busAddr() {
   const auto& g = BoardConfig::ACTIVE.batteryGauge;
   if (g.gaugeAddr == 0) return 0;
-  Wire.begin(g.i2cSda, g.i2cScl, g.i2cHz);
+  gaugeWire().begin(g.i2cSda, g.i2cScl, g.i2cHz);
   return g.gaugeAddr;
 }
 
 bool writeBytes(uint8_t addr, uint8_t reg, const uint8_t* data, uint8_t n) {
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-  if (Wire.write(data, n) != n) return false;
-  return Wire.endTransmission() == 0;
+  TwoWire& w = gaugeWire();
+  w.beginTransmission(addr);
+  w.write(reg);
+  if (w.write(data, n) != n) return false;
+  return w.endTransmission() == 0;
 }
 
 bool readBytes(uint8_t addr, uint8_t reg, uint8_t* data, uint8_t n) {
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false;  // repeated start
-  if (Wire.requestFrom(addr, n, static_cast<uint8_t>(1)) < n) return false;
-  for (uint8_t i = 0; i < n; ++i) data[i] = Wire.read();
+  TwoWire& w = gaugeWire();
+  w.beginTransmission(addr);
+  w.write(reg);
+  if (w.endTransmission(false) != 0) return false;  // repeated start
+  if (w.requestFrom(addr, n, static_cast<uint8_t>(1)) < n) return false;
+  for (uint8_t i = 0; i < n; ++i) data[i] = w.read();
   return true;
 }
 

@@ -237,6 +237,41 @@ void drawSoftKeyBar(Gfx& gfx, const char* const* labels, const uint8_t longPress
 }
 }  // namespace
 
+// Touch hit-test twin of the bar painter (Sticky: the soft-key tabs ARE the
+// front buttons). Returns the slot (0..3) under the LOGICAL point (x, y), or
+// -1. Deliberately more forgiving than the drawn tab: in portrait the WHOLE
+// bottom SOFTKEY_BAR_H strip routes to a slot by x (finger targets at ~235 PPI
+// need ~44 px); in landscape the whole right column does the same by y. Uses
+// the same margin/gap constants as the painter so the hit rects always match
+// what is on glass. BoardConfig::hasTouch() gates it to touch boards.
+int softKeySlotAt(Gfx& gfx, int x, int y) {
+  if (!BoardConfig::hasTouch()) return -1;
+  const int w = gfx.width();
+  const int h = gfx.height();
+  if (gfx.orientation() == Gfx::Orient::Landscape) {
+    // Vertical bar: colW strip on the right edge, 4 slots stacked with slot 0
+    // at the BOTTOM (drawSoftKeyTabVertical).
+    const int colW = Scene::SOFTKEY_BAR_H - 6;
+    if (x < w - colW) return -1;
+    const int marginY = (h * kBarMarginPct) / 100;
+    const int fullSlotH = (h - 2 * marginY - 3 * kTabGapV) / 4;
+    if (fullSlotH <= 0) return -1;
+    const int rel = (h - marginY) - y;  // distance up from the bottom margin
+    if (rel < 0) return -1;
+    const int slot = rel / (fullSlotH + kTabGapV);
+    return (slot >= 0 && slot < 4) ? slot : -1;
+  }
+  // Portrait: bottom strip routed by x.
+  if (y < h - Scene::SOFTKEY_BAR_H) return -1;
+  const int marginX = (w * kBarMarginPct) / 100;
+  const int slotW = (w - 2 * marginX - 3 * kTabGap) / 4;
+  if (slotW <= 0) return -1;
+  if (x < marginX || x >= w - marginX) return -1;
+  const int rel = x - marginX;
+  const int slot = rel / (slotW + kTabGap);
+  return (slot >= 0 && slot < 4) ? slot : -1;
+}
+
 int Scene::softKeySlotCenterX(Gfx& gfx, int slot) {
   const TabGeom g = softKeyTabGeom(gfx, slot, /*isIcon=*/false);
   return g.x + g.w / 2;
