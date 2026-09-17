@@ -43,6 +43,14 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <BoardConfig.h>
+#include "Gfx.h"
+
+// Touch hit-test (Scene.cpp): which soft-key slot a LOGICAL point falls in.
+// Forward-declared here (not #include "Scene.h") because Scene.h includes this
+// header — the include would be circular.
+int softKeySlotAt(Gfx& gfx, int x, int y);
+
 enum class Btn : uint8_t { Up = 0, Down, Left, Right, Confirm, Back, COUNT };
 
 class Input {
@@ -50,6 +58,16 @@ class Input {
   // Hold time that turns a press into a long-press. ~550ms: longer than any
   // deliberate tap, shorter than the SDK's own 650ms confirm-back hold.
   static constexpr unsigned long kLongPressMs = 550;
+
+  // Sticky shared OK/power pin (GPIO4): the one button is BOTH Confirm and
+  // power/wake, so the two gesture sets must not overlap. Confirm only ever
+  // TAPS from this pin — its long-press is disabled here (a touch long-press
+  // on the Confirm soft-key tab supplies that gesture instead, §5.3), and any
+  // hold that reaches the nap threshold is a power gesture, not a Confirm.
+  // checkPowerButton() (main.cpp) uses the same kStickyNapMinMs to decide nap.
+  static constexpr unsigned long kStickyNapMinMs = 1500;   // >= this hold = power, not Confirm
+  static constexpr unsigned long kStickyOffMs = 5000;      // release >= this = deep sleep
+  static constexpr unsigned long kStickyRestartMs = 10000; // held this long = restart
 
   void begin() {
     _mgr.begin();  // pinMode + ADC attenuation per BoardConfig
@@ -223,6 +241,84 @@ class Input {
     }
   }
 
+  // Touch → button routing (Sticky). Runs on the sampling task right after
+  // _mgr.update() so the GT911 events are fresh. A tap on a soft-key tab
+  // injects that logical button; a horizontal swipe injects Left/Right.
+  // Compiled only on touch boards; inert otherwise.
+  void serviceTouchButtons(unsigned long now) {
+#if FREEINK_CAP_TOUCH
+    if (!_mgr.hasTouch()) return;
+    // Panel-native (0..1) -> native px -> LOGICAL px. drawPixel()'s portrait
+    // transform (Gfx.cpp: phyX = y; phyY = logicalW - 1 - x) inverts to:
+    //   logicalX = logicalW - 1 - nativeY;   logicalY = nativeX
+    // where logicalW = native panel HEIGHT. In Gfx Landscape (reader) the
+    // transform is the identity.
+    const int natW = BoardConfig::ACTIVE.displayWidth;
+    const int natH = BoardConfig::ACTIVE.displayHeight;
+    auto toLogical = [&](float nx, float ny, int& lx, int& ly) {
+      const int px = static_cast<int>(nx * natW);
+      const int py = static_cast<int>(ny * natH);
+      if (G_GFX && G_GFX->orientation() == Gfx::Orient::Portrait) {
+        lx = natH - 1 - py;
+        ly = px;
+      } else {
+        lx = px;
+        ly = py;
+      }
+    };
+    float nx, ny;
+    if (_mgr.wasTouchTap(nx, ny)) {
+      // A touch that already fired its long-press does NOT also tap on release
+      // (mirrors the physical machine: a long-press consumes the hold).
+      const bool wasLong = _touchLongFired;
+      _touchLongFired = false;  // contact ended; rearm for the next one
+      if (!wasLong) {
+        int lx, ly;
+        toLogical(nx, ny, lx, ly);
+        const int slot = softKeySlotAt(*G_GFX, lx, ly);
+        if (slot >= 0) {
+          // Soft-key slot order is Back=0, Confirm=1, Left=2, Right=3 — the same
+          // fixed map as kMap. Route through the same latch as a physical press.
+          static constexpr Btn kSlotBtn[4] = {Btn::Back, Btn::Confirm, Btn::Left, Btn::Right};
+          injectTap(kSlotBtn[slot]);
+        }
+      }
+      _lastActivityMs = now;
+      return;  // a tap is never also a swipe
+    }
+    // Touch LONG-PRESS on a tab: a held finger still within tap slop past
+    // kLongPressMs injects that button's long-press (this is how Confirm-long
+    // — bookmark delete, clear-all — is reached on the Sticky, since the
+    // physical OK pin's own long-press is reserved for power). Fires once per
+    // contact; the release then produces no tap (the hold consumed it).
+    unsigned long heldMs = 0;
+    if (!_touchLongFired && _mgr.isTouchTapCandidate(nx, ny, heldMs) && heldMs >= kLongPressMs) {
+      int lx, ly;
+      toLogical(nx, ny, lx, ly);
+      const int slot = softKeySlotAt(*G_GFX, lx, ly);
+      if (slot >= 0) {
+        static constexpr Btn kSlotBtn[4] = {Btn::Back, Btn::Confirm, Btn::Left, Btn::Right};
+        injectLong(kSlotBtn[slot]);
+        _touchLongFired = true;
+      }
+      _lastActivityMs = now;
+    }
+    if (!_mgr.isTouchPressed()) _touchLongFired = false;  // rearm on lift
+    float sx0, sy0, sx1, sy1;
+    if (_mgr.wasSwipe(sx0, sy0, sx1, sy1)) {
+      // Horizontal swipes map to Left/Right in the native frame's x axis
+      // (native -x = logical left, +x = logical right after the rotation).
+      const float dxn = sx1 - sx0;
+      constexpr float kSwipeMin = 0.06f;  // ~48 px on the 800px native axis
+      if (dxn <= -kSwipeMin) injectTap(Btn::Left);
+      else if (dxn >= kSwipeMin) injectTap(Btn::Right);
+      _lastActivityMs = now;
+    }
+#else
+    (void)now;
+#endif
+  }
+
   // One SDK sample + tap/long-press machine pass; results latch into the
   // pending masks (OR-accumulated until the main loop drains them).
   void sampleOnce() {
@@ -233,22 +329,37 @@ class Input {
       const bool down = _mgr.isPressed(kMap[i]);
       if (down) levels |= (1u << i);
       if (down) _lastActivityMs = now;
+      // Sticky shared OK/power pin: the Confirm button is GPIO4, the power
+      // button's pin. A hold that reaches the nap threshold is a POWER gesture,
+      // not a Confirm — suppress the pending tap and never fire Confirm-long
+      // from this pin (touch supplies Confirm-long on the soft-key tab).
+      const bool sharedPowerConfirm =
+          BoardConfig::isSticky() && i == static_cast<uint8_t>(Btn::Confirm);
       if (down) {
         if (!_held[i]) {  // press edge: start the hold clock
           _held[i] = true;
           _longFired[i] = false;
           _pressStartMs[i] = now;
-        } else if (!_longFired[i] && now - _pressStartMs[i] >= kLongPressMs) {
+        } else if (!_longFired[i] && !sharedPowerConfirm && now - _pressStartMs[i] >= kLongPressMs) {
           _longFired[i] = true;  // fire-once while held, no repeat
           longBits |= (1u << i);
         }
       } else if (_held[i]) {  // release edge
         _held[i] = false;
-        if (!_longFired[i]) tapBits |= (1u << i);  // short hold -> tap
-        // else: the long-press already consumed this hold — no tap.
+        const unsigned long heldMs = now - _pressStartMs[i];
+        // On the shared pin, a hold that reached the nap threshold belongs to
+        // the power path — swallow the tap so release doesn't ALSO Confirm.
+        const bool powerOwns = sharedPowerConfirm && heldMs >= kStickyNapMinMs;
+        if (!_longFired[i] && !powerOwns) tapBits |= (1u << i);  // short hold -> tap
+        // else: the long-press (or the power gesture) consumed this hold — no tap.
       }
     }
     const bool any = _mgr.wasAnyPressed();
+    // Touch (Sticky): a tap on a soft-key tab injects that button; a horizontal
+    // swipe injects Left/Right. Both reuse the same latch path as a physical
+    // press, so every scene works unchanged. Touch counts as activity so the
+    // idle/nap timers reset.
+    serviceTouchButtons(now);
     portENTER_CRITICAL(&_mux);
     _pendingTap |= tapBits;
     _pendingLong |= longBits;
@@ -355,6 +466,7 @@ class Input {
   bool _powerIgnoreUntilUp = false;
   unsigned long _powerLastReleaseMs = 0;
   bool _longFired[kBtnCount] = {};
+  bool _touchLongFired = false;  // one touch long-press per contact (Sticky)
 
   // Latches: sampling context -> main loop (guarded by _mux).
   uint8_t _pendingTap = 0;

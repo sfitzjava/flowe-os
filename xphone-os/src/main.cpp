@@ -28,6 +28,7 @@
 #include <freertos/task.h>
 
 #include "BatteryGauge.h"
+#include "BoardSticky.h"
 #include "net/WifiCreds.h"
 #include <Preferences.h>
 #include "BenchGlass.h"
@@ -176,11 +177,13 @@ static void drawBootSplash(Gfx& g) {
 // ---------------------------------------------------------------------------
 
 #include <SDCardManager.h>
-#include <XteinkDetect.h>
+#if !(defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY)
+#include <XteinkDetect.h>  // Xteink-only I2C fingerprint; not linked on Sticky
+#endif
 
 #include "DeviceKind.h"
 
-bool gDeviceIsX3 = false;  // set in boot() by selectXteinkDevice(); X4 = SDK default
+bool gDeviceIsX3 = false;  // set in boot() by selectXteinkDevice(); X4/Sticky = SDK default
 
 // Remote-debug breadcrumbs for units that never paint (field X3 that hangs
 // under xphone-os with no serial access; CrossPoint works). Armed ONLY when
@@ -228,6 +231,10 @@ static const char* resetReasonLabel(esp_reset_reason_t reason) {
 }
 
 static void boot() {
+  // Sticky: latch the main power rail BEFORE anything else — the device powers
+  // off the instant the power button is released unless GPIO45 holds the rail
+  // (BoardSticky.cpp). No-op on X3/X4.
+  BoardSticky::powerHold();
   const unsigned long tBoot = millis();
 
   // Capture the wake diagnostic first — before anything else can perturb it.
@@ -279,27 +286,41 @@ static void boot() {
       }
     }
   }
+#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+  // Single-device S3 build: no Xteink fingerprint (the probe targets X3-only
+  // parts on a bus the Sticky uses for its fuel gauge). BoardConfig::ACTIVE is
+  // already STICKY via DEFAULT_DEVICE; selectDevice() is called explicitly so
+  // the intent is greppable and matches the X3/X4 path's structure.
+  BoardConfig::selectDevice(BoardConfig::Board::Sticky);
+  gDeviceIsX3 = false;  // "not X3": every gDeviceIsX3 branch is the X4/SSD1677
+                        // behavior, which is what the Sticky's panel wants.
+#else
   gDeviceIsX3 = freeink::selectXteinkDevice();
   if (gDeviceIsX3) Sleep::imuSleepAtBoot();  // P1.2: the unused motion sensor sleeps from boot
+#endif
   // Say WHICH build this is, before anything can hang. A stuck unit cannot
   // reach the About screen, so until now a field report could not name its
   // firmware at all — and the panel fix for newer X3 units is exactly the
   // kind of thing where "which version are you on" IS the whole diagnosis.
   // The web flasher reads this line straight off the USB serial.
   Serial.printf("[xphone-os] flowe %s (%s)\n", XPHONE_VERSION, XPHONE_GIT_REV_STR);
+#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+  Serial.println("[xphone-os] boot: device = Sticky (compile-time)");
+#else
   Serial.printf("[xphone-os] boot: xteink detect -> %s\n", gDeviceIsX3 ? "X3" : "X4");
+#endif
   stallwatch::begin();
   if (gDeviceIsX3) {
     display.setDisplayX3();
   }
   // Shared SPI bus, initialized ONCE with the SD card's MISO attached
-  // (mirrors x4-os/lib/hal/HalGPIO.cpp:195). Display and SD share SCLK=8 /
-  // MOSI=10; SD adds MISO=7 + CS=12 (BoardConfig.h XTEINK_X3/X4 profiles).
-  // This must run before display.begin(): EpdBus::begin() calls SPI.begin()
-  // with miso=-1 (UC8253/SSD1677 use none), and arduino-esp32 SPIClass::begin
-  // is first-call-wins — a MISO-less first init would leave the SD card
-  // unreadable. SDCardManager itself never remaps pins on X3/X4 (sd.sclk is
-  // unassigned), so this is the only place the bus is configured.
+  // (mirrors x4-os/lib/hal/HalGPIO.cpp:195). Pins come from the ACTIVE profile
+  // (X3/X4: SCLK=8/MOSI=10, SD MISO=7/CS=12; Sticky: SCLK=13/MOSI=14, SD
+  // MISO=12/CS=8). This must run before display.begin(): EpdBus::begin() calls
+  // SPI.begin() with miso=-1 (UC8253/SSD1677 use none), and arduino-esp32
+  // SPIClass::begin is first-call-wins — a MISO-less first init would leave
+  // the SD card unreadable. SDCardManager itself never remaps pins on X3/X4
+  // (sd.sclk is unassigned), so this is the only place the bus is configured.
   SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
             BoardConfig::ACTIVE.display.cs);
 
@@ -313,7 +334,9 @@ static void boot() {
     if (probe) {
       probe.close();
       gBootTrace = true;
-      bootTrace(gDeviceIsX3 ? "boot: spi up, detect=X3" : "boot: spi up, detect=X4");
+      bootTrace(gDeviceIsX3 ? "boot: spi up, detect=X3"
+                : BoardConfig::isSticky() ? "boot: spi up, device=Sticky"
+                                          : "boot: spi up, detect=X4");
     }
     // Did the last run freeze? The watcher wrote WHERE into RTC memory,
     // which the reset button does not clear. Put it on the card now, while
@@ -327,7 +350,8 @@ static void boot() {
       if (f) {
         char line[192];
         const int n = snprintf(line, sizeof(line), "flowe %s (%s) on %s: %s\n", XPHONE_VERSION,
-                               XPHONE_GIT_REV_STR, gDeviceIsX3 ? "X3" : "X4", stall);
+                               XPHONE_GIT_REV_STR,
+                               gDeviceIsX3 ? "X3" : (BoardConfig::isSticky() ? "Sticky" : "X4"), stall);
         if (n > 0) f.write(reinterpret_cast<const uint8_t*>(line), static_cast<size_t>(n));
         f.flush();
         f.close();
@@ -961,14 +985,19 @@ static void exitNap(const char* why) {
 }
 
 static void checkPowerButton() {
-  // Short press: nap (or wake from a nap). Hold 2.5 s: off (deep sleep).
-  // Hold 8 s: restart. A press is taken on its RELEASE with the hold the
-  // 5 ms task measured, so a quick tap never falls between idle slices; the
-  // minimum is 30 ms, since the SDK debounce already rejects bounces
-  // (the 80 ms floor read about half of quick taps as blips on 0.6.6).
-  constexpr unsigned long kRestartHoldMs = 8000;
-  constexpr unsigned long kOffHoldMs = 2500;
-  constexpr unsigned long kMinPressMs = 30;
+  // X3/X4 (dedicated power pin): short press = nap (or wake), 2.5 s = off,
+  // 8 s = restart. A press is taken on its RELEASE with the hold the 5 ms task
+  // measured, so a quick tap never falls between idle slices; the 30 ms floor
+  // exists because the SDK debounce already rejects bounces.
+  //
+  // Sticky (OK/power share GPIO4): the SAME pin is also Confirm, so the power
+  // gestures must live strictly above the Confirm gestures (tap < 1500 ms,
+  // Input.h). Nap therefore starts at 1500 ms, off at 5 s, restart at 10 s —
+  // and a release below 1500 ms is a Confirm tap, never a nap.
+  const bool sticky = BoardConfig::isSticky();
+  const unsigned long kRestartHoldMs = sticky ? Input::kStickyRestartMs : 8000;
+  const unsigned long kOffHoldMs = sticky ? Input::kStickyOffMs : 2500;
+  const unsigned long kNapMinMs = sticky ? Input::kStickyNapMinMs : 30;
 
   const bool down = input.powerPressed();
 
@@ -988,13 +1017,13 @@ static void checkPowerButton() {
       Serial.printf("[xphone-os] power held %lums; off\n", held);
       Sleep::sleepNow(gfx, input);  // never returns
     }
-    if (held >= kMinPressMs) {
+    if (held >= kNapMinMs) {
       Serial.printf("[xphone-os] power pressed %lums; %s\n", held, gNapping ? "wake" : "nap");
       if (gNapping) exitNap("power");
       else enterNap("power press");
       return;
     }
-    Serial.printf("[xphone-os] power blip %lums ignored\n", held);
+    Serial.printf("[xphone-os] power blip %lums ignored%s\n", held, sticky ? " (Confirm tap)" : "");
   }
 }
 
@@ -1369,7 +1398,9 @@ static void lightSleepTick() {
   if (now - lastGaugeMs >= 5000) {
     lastGaugeMs = now;
     int16_t ma = 0;
-    if (gDeviceIsX3 && BatteryGauge::readAvgCurrentMa(ma)) {
+    // Any I2C-gauge device (X3, Sticky): readAvgCurrentMa returns false when
+    // the profile has no gauge (X4), so no device gate is needed here.
+    if (BatteryGauge::readAvgCurrentMa(ma)) {
       const bool nowCharging = ma > 5;
       chargingAppeared = nowCharging && !charging;
       charging = nowCharging;
@@ -1482,7 +1513,9 @@ static void checkAutoSleep() {
   if (!offAfter) return;  // OFF set to Never: the nap (or the awake screen) holds
   if (idle < offAfter) return;
   int16_t ma = 0;
-  const bool charging = gDeviceIsX3 && BatteryGauge::readAvgCurrentMa(ma) && ma > 5;
+  // readAvgCurrentMa is false when the active profile has no I2C gauge (X4);
+  // on a gauge device (X3, Sticky) positive current means a cable is in.
+  const bool charging = BatteryGauge::readAvgCurrentMa(ma) && ma > 5;
   static bool chargeHoldLogged = false;
   if (charging) {
     if (!chargeHoldLogged) {

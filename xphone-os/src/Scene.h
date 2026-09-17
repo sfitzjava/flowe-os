@@ -131,6 +131,12 @@ struct RefreshStats {
 };
 extern RefreshStats gRefreshStats;
 
+// Touch hit-test (Sticky): which soft-key slot (0..3) is under the LOGICAL
+// point (x, y), or -1. Implemented in Scene.cpp beside the bar painter so the
+// hit rects always match the drawn tabs. Used by Input to route a touch tap
+// on a tab to the matching logical button. Returns -1 on non-touch boards.
+int softKeySlotAt(Gfx& gfx, int x, int y);
+
 // Ghost-scrub cadence: force a full-panel HALF scrub after this many
 // differential (FAST/PARTIAL) refreshes. Evidence in Scene.cpp's policy
 // comment; surfaced here so About can show it next to the rolling count.
