@@ -22,7 +22,15 @@ namespace CompanionProtocol {
 // name, so only the human-visible label changes — SERVICE_UUID must never.
 // Runtime: one universal binary serves both devices (DeviceKind.h, set at
 // boot by the I2C fingerprint). BLE init happens well after detection.
-inline const char* deviceName() { return ::gDeviceIsX3 ? "xphone X3" : "xphone X4"; }
+// Compile-time: the Sticky build (FREEINK_DEVICE_STICKY=1) is a separate S3
+// binary, so use the compile-time define.
+inline const char* deviceName() {
+#if defined(FREEINK_DEVICE_STICKY) && FREEINK_DEVICE_STICKY
+    return "xphone Sticky";
+#else
+    return ::gDeviceIsX3 ? "xphone X3" : "xphone X4";
+#endif
+}
 constexpr const char* SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr const char* CARD_WRITE_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr const char* ACTION_NOTIFY_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
