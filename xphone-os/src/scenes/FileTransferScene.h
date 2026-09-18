@@ -9,24 +9,17 @@
 // phone can start/stop the whole mode remotely ("transfer.start" command —
 // main.cpp pumps it into showFileTransferAutoStart()).
 //
-// Station mode only: the device joins the user's Wi-Fi. (A softAP/hotspot
-// fallback shipped briefly but was unreliable and saved almost no RAM to
-// remove-at-compile-time, so it's gone — provisioning happens in the app.)
+// Routes: shared Wi-Fi (STA) or the reader hotspot (AP). Phone sync keeps
+// the current picture with a black status bar. Manual File Transfer shows
+// connection help. When a hotspot client joins, or a verified shared-network
+// client reaches /api/status, the bar finishes drawing and display RAM is
+// released for networking. The picture stays on glass.
+// The phone shows detailed progress. Physical BACK and USB can cancel.
 //
-// States: Idle -> Connecting -> Running | Failed. The scene's handleInput
-// tick pumps FileTransferServer::handleClient(); all SD access stays on the
-// main loop.
-//
-// Exit (rewritten 2026-09-04, the no-restart exit): every way out of a
-// session goes through endSession(): the phone's POST /stop, BLE
-// "transfer.stop", the EXIT/BACK key, BACK while joining, the idle and
-// hotspot guards, the failed-screen linger, and the OS launcher jump. It
-// stops the server, turns Wi-Fi fully off (esp_wifi_deinit), brings BLE
-// back in place, and returns to the launcher. Until then every one of
-// those paths called esp_restart() (CrossPoint's silentRestart lesson,
-// "rebooting defragments after Wi-Fi"), which lost the clock, the card
-// stores, and ~15 s of the user's time per sync. The 10-cycle bench in
-// docs/plans/2026-09-03-transfer-scope.md is the evidence the heap holds.
+// Every active session ends after the HTTP handler returns: stop the server,
+// shut Wi-Fi down, then use the existing quiet restart to restore the saved
+// scene and reader page. In-process Wi-Fi-test exits restore display memory
+// before BLE or drawing. Failed restoration uses the same quiet restart.
 
 #include <WiFiGeneric.h>
 
@@ -58,22 +51,22 @@ class FileTransferScene : public Scene {
   // BACK (found live, 2026-08-23).
   void restartFromCard(bool direct);
 
-  // Sync in place (Andrew, 2026-09-04): a phone-started sync no longer
-  // jumps to this page. The scene takes over the loop (it needs the memory
-  // the reader held), but never repaints: the previous screen's picture
-  // stays on glass and a small pill in the header says "Syncing...". The
-  // full page comes up only when a person has to see it (the hotspot's
-  // QR code after nobody joined, a failure). At the end the scene we came
-  // from returns, the reader quietly (no "Opening book..." blink).
+  // Phone start keeps the previous picture for the whole session. Remember
+  // the previous scene so the normal quiet restart can return there.
   void beginSilent(uint32_t returnSceneId);
   bool silent() const { return _silent; }
   bool suppressRepaint() const override { return _silent; }
 
   bool radioActive() const { return _state != State::Idle && _state != State::Failed; }
 
+
  private:
   enum class State : uint8_t { Idle, Connecting, Running, Failed };
 
+  bool activateSyncMemory(bool associatedHotspot = false);
+  void restoreSyncMemory();
+  bool _staticSync = false;
+  bool _framebufferReleased = false;
   void startSta();
   void startAp();            // W2 Direct mode: the device's own hotspot (BLE notice, then raiseHotspot)
   // The radio half of the hotspot: AP up, server up. Also the landing of
@@ -98,9 +91,8 @@ class FileTransferScene : public Scene {
 
   void tryNextCandidate();   // W1: advance the scan-ordered join list
 
-  void silentTick();                   // per-loop: keep the pill current, escalate when needed
-  void paintPill(const char* text);    // the inverted sync bar over the soft keys (2026-09-07)
-  void leaveSilent(const char* why);   // show the full page from now on
+  void silentTick();                   // keep the bar current until display RAM is released
+  bool paintPill(const char* text);    // true after the inverted sync bar finishes drawing
   bool _silent = false;                // no repaints: the pill over the previous picture
   bool _inPlace = false;               // started from another screen; go back there at the end
   uint32_t _returnSceneId = 0;         // SceneId of the screen we came from
@@ -114,6 +106,10 @@ class FileTransferScene : public Scene {
   // The route the phone asked for (transfer.start "ssid"/"pass"). Given =
   // join that network only; empty = the old walk over every saved network.
   bool _targetGiven = false;
+  // The phone is on Wi-Fi but its OS withheld the name, so it could give no
+  // target. It still wants the hotspot rescue a named target would get: a
+  // session that cannot be reached becomes the hotspot instead of failing.
+  bool _hotspotFallback = false;
   char _targetSsid[64] = {0};
   char _targetPass[64] = {0};
   bool _targetSessionCreds = false;  // the pass came with the card (the phone's own hotspot), not from the store
@@ -122,7 +118,7 @@ class FileTransferScene : public Scene {
   bool _showApPassword = false;  // hotspot screen: QR by default, text on demand
   int _shownApClients = -1;  // last reported hotspot client count
   uint32_t _apStartedMs = 0;
-  uint32_t _apClientSeenMs = 0;
+  uint32_t _apClientLeftMs = 0;
   // Idle guard for the INFRASTRUCTURE (STA) path. The hotspot path has had
   // a no-client watchdog since W2, but a LAN session had none: when the
   // phone died mid-upload the device sat in Wi-Fi mode for ever, with BLE

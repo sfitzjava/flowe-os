@@ -4,6 +4,7 @@
 
 #include <Preferences.h>
 #include "CompanionBleService.h"
+#include "ReaderProgressChunks.h"
 
 #include <ArduinoJson.h>
 
@@ -875,14 +876,17 @@ void CompanionBleService::shutdownRadio(const bool releaseMemory, const char* re
   LOG_INF("X4CMP", "BLE shutdown done: heap now %u", ESP.getFreeHeap());
 }
 
-bool CompanionBleService::takeTransferTarget(char* ssid, size_t ssidSize, char* pass, size_t passSize) {
+bool CompanionBleService::takeTransferTarget(char* ssid, size_t ssidSize, char* pass, size_t passSize,
+                                             bool* hotspotFallback) {
   ensureMutex();
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   const bool has = transferTargetSsid[0] != '\0';
   snprintf(ssid, ssidSize, "%s", transferTargetSsid);
   snprintf(pass, passSize, "%s", transferTargetPass);
+  if (hotspotFallback) *hotspotFallback = transferHotspotFallback;
   transferTargetSsid[0] = '\0';
   transferTargetPass[0] = '\0';
+  transferHotspotFallback = false;
   xSemaphoreGive(stateMutex);
   return has;
 }
@@ -892,6 +896,13 @@ void CompanionBleService::setTransferTarget(const char* ssid, const char* pass) 
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   snprintf(transferTargetSsid, sizeof(transferTargetSsid), "%s", ssid ? ssid : "");
   snprintf(transferTargetPass, sizeof(transferTargetPass), "%s", pass ? pass : "");
+  xSemaphoreGive(stateMutex);
+}
+
+void CompanionBleService::setTransferHotspotFallback(bool on) {
+  ensureMutex();
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  transferHotspotFallback = on;
   xSemaphoreGive(stateMutex);
 }
 
@@ -1483,6 +1494,10 @@ bool CompanionBleService::applyCardPayload(const std::string& payload) {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     snprintf(transferTargetSsid, sizeof(transferTargetSsid), "%s", doc["ssid"] | "");
     snprintf(transferTargetPass, sizeof(transferTargetPass), "%s", doc["pass"] | "");
+    // "fallback": no ssid because the phone's OS withheld the name, NOT
+    // because there is no network. Old apps never send it, so they keep the
+    // old saved-list behaviour exactly.
+    transferHotspotFallback = doc["fallback"] | false;
     xSemaphoreGive(stateMutex);
     transferRequest = TransferRequest::Start;
     return true;
@@ -1491,8 +1506,12 @@ bool CompanionBleService::applyCardPayload(const std::string& payload) {
     // W3: the phone mints a per-session token over the encrypted link;
     // mutating HTTP endpoints require it for the session that follows.
     // RAM only — a restart clears it.
-    extern void transferSetSessionToken(const char* token);
-    transferSetSessionToken(doc["token"] | "");
+    extern void transferSetSessionToken(const char* token, bool ownedReadiness);
+    // New apps opt into strict HTTP readiness on this encrypted link.
+    // Old apps omit the field. Invalid non-null values fail strict.
+    const JsonVariantConst readiness = doc["ownedReadiness"];
+    const bool strict = readiness.is<bool>() ? readiness.as<bool>() : !readiness.isNull();
+    transferSetSessionToken(doc["token"] | "", strict);
     return true;
   }
   if (std::strcmp(type, "transfer.direct") == 0) {
@@ -1982,7 +2001,14 @@ void CompanionBleService::sendWifiKnown() {
       return;
     }
   }
-  std::string payload = "{\"saved\":[";
+  std::string payload = "{";
+  char readerId[WifiCreds::kReaderIdSize];
+  if (WifiCreds::readerId(readerId, sizeof(readerId))) {
+    payload += "\"readerId\":\"";
+    payload += readerId;
+    payload += "\",";
+  }
+  payload += "\"saved\":[";
   WifiCreds::Network net;
   for (int i = 0; WifiCreds::get(i, &net); i++) {
     if (i) payload += ',';
@@ -2038,7 +2064,14 @@ void CompanionBleService::sendWifiKnown() {
     appendJsonEscaped(payload, apSsid);
     payload += "\",\"pass\":\"";
     appendJsonEscaped(payload, apPass);
-    payload += "\"}";
+    payload += '\"';
+    char bssid[18];
+    if (WifiCreds::apBssid(bssid, sizeof(bssid))) {
+      payload += ",\"bssid\":\"";
+      payload += bssid;
+      payload += '\"';
+    }
+    payload += '}';
   }
   char failSsid[WifiCreds::kMaxSsid];
   int failReason = 0;
@@ -2350,17 +2383,15 @@ void CompanionBleService::sendTransferStatus(const char* state, const char* ip, 
 // characteristic — the same envelope the shelf uses, because the phone already
 // knows how to reassemble that shape.
 //
-// The payload is ReadingStats::toJson(), which is ~1.5 KB at its largest: a
-// 64-day ring and a 64-book table. Small enough to send whole on every connect,
-// which is the point — the app should be correct when you open it, not after
-// you remember to start a Wi-Fi session.
+// Count and stream the resident statistics. A full history can exceed 10 KB;
+// building one growing string here can exhaust the heap while a book is open.
 void CompanionBleService::sendReaderProgress() {
   if (!isConnected() || !actionCharacteristic) return;  // radio may be down (audit)
-  const std::string payload = reader::ReadingStats::toJson();
   uint16_t mtu = 23;
+  uint16_t connHandle = 0xffff;
 #if defined(CONFIG_NIMBLE_ENABLED)
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  const uint16_t connHandle = secConnHandle;
+  connHandle = secConnHandle;
   xSemaphoreGive(stateMutex);
   if (connHandle != 0xffff) {
     const uint16_t live = ble_att_mtu(connHandle);
@@ -2383,45 +2414,49 @@ void CompanionBleService::sendReaderProgress() {
     Serial.printf("[xphone-os] ble: reader.progress deferred (mtu %u)\n", static_cast<unsigned>(mtu));
     return;
   }
-  const size_t bodyBudget = chunkBudget - kEnvelopeOverhead;
+  size_t total = 0;
+  const bool counted = reader::ReadingStats::writeJson(
+      [](const char*, size_t length, void* context) {
+        auto& count = *static_cast<size_t*>(context);
+        if (length > 65535 - count) return false;
+        count += length;
+        return true;
+      }, &total);
+  if (!counted) return;
 
-  const uint32_t token = millis();
-  uint16_t seq = 0;
-  size_t sent = 0;
-  char json[560];
-  do {
-    // Split on raw bytes, not JSON structure: the phone concatenates the
-    // pieces and parses once. The slice IS JSON text — full of double
-    // quotes — so it MUST be escaped into the carrying string. (The first
-    // version skipped this on the theory the payload was "hashes and
-    // numbers only"; every chunk was invalid JSON and both phones dropped
-    // them silently. Found on Android, 2026-08-18.)
-    // Escaping doubles a quote's size, so budget half the body per chunk.
-    const size_t rawBudget = bodyBudget / 2;
-    const size_t take = payload.size() - sent < rawBudget ? payload.size() - sent : rawBudget;
-    const std::string slice = payload.substr(sent, take);
-    sent += take;
-    const bool done = sent >= payload.size();
-    std::string escaped;
-    escaped.reserve(slice.size() * 2);
-    for (const char c : slice) {
-      if (c == '"' || c == '\\') escaped += '\\';
-      escaped += c;
-    }
-    // "len": the whole payload's byte count, so the phone can tell a
-    // complete reassembly from one with a hole before it parses.
-    snprintf(json, sizeof(json),
-             "{\"schemaVersion\":1,\"type\":\"reader.progress\",\"tok\":%lu,\"seq\":%u,"
-             "\"done\":%s,\"len\":%u,\"d\":\"%s\"}",
-             static_cast<unsigned long>(token), static_cast<unsigned>(seq),
-             done ? "true" : "false", static_cast<unsigned>(payload.size()), escaped.c_str());
-    actionCharacteristic->setValue(json);
-    notifyAction();
-    seq++;
-    delay(20);  // let the NimBLE host drain its notify buffers
-  } while (sent < payload.size());
-  Serial.printf("[xphone-os] ble: reader.progress %u bytes in %u chunks\n",
-                static_cast<unsigned>(payload.size()), static_cast<unsigned>(seq));
+  // Both passes run on the main loop, which owns the stats and clock writes.
+  // A midnight boundary can change the computed band; finish() rejects a
+  // changed byte count and the retry below starts a fresh report.
+  struct SendContext { CompanionBleService* service; uint16_t connection; } context{this, connHandle};
+  ReaderProgressChunks chunks(total, chunkBudget, millis(),
+      [](const char* frame, size_t length, void* opaque) {
+        auto& ctx = *static_cast<SendContext*>(opaque);
+        auto& service = *ctx.service;
+        if (!service.isConnected() || !service.actionCharacteristic) return false;
+#if defined(CONFIG_NIMBLE_ENABLED)
+        xSemaphoreTake(service.stateMutex, portMAX_DELAY);
+        const bool sameConnection = service.secConnHandle == ctx.connection;
+        xSemaphoreGive(service.stateMutex);
+        if (!sameConnection) return false;
+#endif
+        service.actionCharacteristic->setValue(reinterpret_cast<const uint8_t*>(frame), length);
+        service.notifyAction();
+        delay(20);  // let the NimBLE host drain its bounded notify buffers
+        return true;
+      }, &context);
+  const bool written = reader::ReadingStats::writeJson(
+      [](const char* bytes, size_t length, void* context) {
+        return static_cast<ReaderProgressChunks*>(context)->append(bytes, length);
+      }, &chunks);
+  const bool complete = written && chunks.finish();
+  if (!complete && isConnected()) {
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    progressRequested = true;
+    progressRetryAtMs = millis() + 1000;
+    xSemaphoreGive(stateMutex);
+  }
+  Serial.printf("[xphone-os] ble: reader.progress %u bytes in %u chunks%s\n",
+                static_cast<unsigned>(total), chunks.frames(), complete ? "" : " incomplete");
 }
 
 void CompanionBleService::sendReaderShelf() {
@@ -2561,7 +2596,7 @@ void CompanionBleService::sendDeviceInfo() {
   std::snprintf(json, sizeof(json),
                 "{\"schemaVersion\":1,\"type\":\"device.info\",\"version\":\"%s\",\"gitRev\":\"%s\","
                 "\"device\":\"%s\",\"slot\":\"%s\",\"otaPending\":%s}",
-                XPHONE_VERSION, XPHONE_GIT_REV_STR, gDeviceIsX3 ? "x3" : "x4",
+                XPHONE_VERSION, XPHONE_GIT_REV_STR, deviceKindLower(),
                 running ? running->label : "?", sd_update::otaPending() ? "true" : "false");
   actionCharacteristic->setValue(json);
   notifyAction();

@@ -12,6 +12,12 @@
 #include <SDCardManager.h>
 
 #include <cstdint>
+// The compact page codec (FBPK 9). The canonical copy is
+// bookc/include/fbp_compact.h; lib/FbpCompact carries a byte-identical
+// vendored copy so the firmware builds standalone in the public flowe-os
+// tree, which has no bookc/. test/host/test_compact_header_vendored.py
+// fails the build the moment the two differ.
+#include <fbp_compact.h>
 
 class Gfx;
 
@@ -53,14 +59,18 @@ class FbpBook {
   const char* author() const { return _author; }
 
   bool renderPage(Gfx& gfx, uint16_t page);
+#if defined(FLOWE_BENCH_COMPACT)
+  bool benchProfile(uint32_t profile, uint16_t* width, uint16_t* height);
+  bool benchBodyCrc(uint16_t page, uint32_t* crc);
+#endif
 
   // Step one size up (dir > 0) or down (dir < 0) in this geometry,
   // wrapping at the ends. Returns the page in the new profile that holds
   // the same first paragraph (content ID) the current page showed — the
   // position survives the re-pagination exactly. On failure (the new
   // profile's page buffer cannot allocate in the current heap) the
-  // PREVIOUS profile is restored and reading continues at the old size —
-  // it must never leave the book unrenderable.
+  // PREVIOUS profile is restored; the caller must redraw its page to restore
+  // word cursors. If rollback also fails, profileSelected() is false.
   bool stepSize(int dir, uint16_t cur_page, uint16_t* new_page);
 
   // Reader menu "Orientation": does this package carry profiles for the
@@ -120,6 +130,7 @@ class FbpBook {
   // the radio could stay up while reading
   // (docs/plans/2026-08-17-buttons-and-orientation.md P6).
   uint32_t lastPeakBytes() const { return _lastPeak; }
+  uint32_t residentBytes() const { return _pageCap + _predictorCap * sizeof(FcPredictor); }
   uint32_t lastUniqGlyphs() const { return _lastUniq; }
 
   // v7: per-line paragraph ids of the LAST rendered page (empty for
@@ -230,6 +241,8 @@ class FbpBook {
   bool readAt(uint64_t off, void* dst, size_t n);
   bool readProfile(uint32_t i, ProfileDir* out);  // v3 stride is 32, v4 is 48
   bool applyProfile(int idx);  // parse this profile's atlas offsets
+  bool profileCapacity(const ProfileDir& d, uint32_t* page, uint32_t* predictors);
+  bool ensureCapacity(uint32_t page, uint32_t predictors);
   bool pageAnchor(const ProfileDir& d, uint16_t page, uint8_t off, uint32_t* out);
   bool pageFirstParaId(const ProfileDir& d, uint16_t page, uint32_t* cid);
   bool pageFirstSentId(const ProfileDir& d, uint16_t page, uint32_t* sid);
@@ -240,7 +253,10 @@ class FbpBook {
   // back-reference simply reaches backwards into it and the dictionary is
   // never overwritten. One allocation per open book, no per-page malloc.
   uint8_t* _page = nullptr;
-  uint32_t _pageCap = 0;   // dict_size + max_raw_page
+  FcPredictor* _predictors = nullptr;
+  uint32_t _predictorCount = 0, _predictorCap = 0;
+  const uint8_t* _wordTextColumn = nullptr;
+  uint32_t _pageCap = 0;   // retained maximum for the selected geometry
   uint32_t _dictLen = 0;
   bool inflatePage(uint64_t rec_off, uint32_t clen, uint32_t raw_len);
   uint32_t _lastPeak = 0;
@@ -266,6 +282,7 @@ class FbpBook {
   uint64_t _fontMetaOff[kMaxFonts] = {0};
   uint64_t _fontBlobOff[kMaxFonts] = {0};
   uint32_t _fontCount[kMaxFonts] = {0};
+  uint32_t _fontBlobSize[kMaxFonts] = {0};
   uint8_t _nfonts = 0;
   char _title[64] = {0};
   char _author[48] = {0};

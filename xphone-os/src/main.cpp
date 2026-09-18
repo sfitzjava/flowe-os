@@ -32,6 +32,9 @@
 #include "net/WifiCreds.h"
 #include <Preferences.h>
 #include "BenchGlass.h"
+#include "BenchFramebufferLoan.h"
+#include "TransferSync.h"
+#include "BenchSdWrite.h"
 #include "BlockStatusStore.h"
 #include "ClockStore.h"
 #include "CompanionSync.h"
@@ -49,8 +52,13 @@
 #include "ble/CompanionAncsClient.h"
 #include "ble/CompanionBleService.h"
 #include "reader/FbpBook.h"
+#if defined(FLOWE_BENCH_COMPACT)
+#include <memory>
+#include <new>
+#endif
 #include "art/FloweLogo.h"
 #include "esp_heap_caps.h"
+#include "TransferMemoryProbe.h"
 #include "esp_system.h"
 #if CONFIG_PM_ENABLE
 // DFS experiment (custom libs only): the stock prebuilt libraries compile
@@ -145,6 +153,7 @@ void quietRestartToScene(uint32_t sceneId) {
                 static_cast<unsigned long>(sceneId), ESP.getFreeHeap(),
                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
   Sleep::armRestoreScene(sceneId);
+  Sleep::persistStoresForRestart();  // the boot re-seeds THESE lists, not the last power-off's
   SCENES.waitFlushIdle();
   input.suspendTask();
   armBenchQuietWake();
@@ -320,6 +329,8 @@ static void boot() {
   // the affected unit is display.begin()'s BUSY waits. SdMan.begin() is
   // idempotent; sd_update below remounts/reuses the same instance.
   if (SdMan.begin()) {
+    if (!FileTransferServer::recoverUploads())
+      Serial.println("[xphone-os] upload recovery pending; prior bytes retained");
     FsFile probe = SdMan.open("/boot-trace.txt", O_RDONLY);
     if (probe) {
       probe.close();
@@ -891,6 +902,7 @@ static void pumpCompanionEvents() {
 Input* Input::sInstance = nullptr;
 
 static bool gNapping = false;
+static bool gSleepPosterPreview = false;  // bench-only awake preview, never enters either sleep state
 static bool gNapOnUsb = false;  // a USB host was attached when the nap began: keep the link, no light sleep
 static SceneId gNapScene = SceneId::Launcher;
 static uint32_t gNapAfterMsOverride = 0;  // bench: napafter <s>
@@ -920,6 +932,7 @@ static void snapshotNapRevisions() {
 // clock; when it runs out the poster is composed again and, if it differs,
 // refreshed with one FAST.
 static void pumpNapPoster() {
+  if (gSleepPosterPreview) return;
   if (PRIORITIES_STORE.revision() != gNapRevPriorities || WORKOUT_STORE.revision() != gNapRevWorkout ||
       TODAY_STORE.revision() != gNapRevToday) {
     snapshotNapRevisions();
@@ -949,6 +962,7 @@ static void enterNap(const char* why) {
   // host's reattach resets the chip (five reboots on the bench, 2026-09-06).
   // On a charger without a host nothing changes.
   gNapOnUsb = usbHostConnected();
+  Sleep::requestFreshCardsNow();  // a connected phone refreshes the lists before the poster (2026-09-17)
   Sleep::drawSleepScreenNow(gfx, /*napping=*/true);
   SCENES.setPaused(true);  // nothing paints over the sleep screen (the link dot, cards)
   snapshotNapRevisions();
@@ -961,6 +975,7 @@ static void enterNap(const char* why) {
 static void exitNap(const char* why) {
   if (!gNapping) return;
   gNapping = false;
+  gSleepPosterPreview = false;
   gNapCleanAtMs = 0;  // a wake before the clean: the FAST differential works from the poster as it is
   Serial.printf("[xphone-os] nap: wake (%s)\n", why);
   SCENES.setPaused(false);
@@ -1411,7 +1426,7 @@ static void lightSleepTick() {
   // A Wi-Fi session (BLE down, so "disconnected") must never nap either:
   // a light-sleeping chip drops the TCP stream under the phone (2026-09-04).
   const bool transfer = gCurrentSceneId == SceneId::FileTransfer;
-  const bool allowed = !usbGrace && !transfer && (gLsMode == LsMode::On || (gLsMode == LsMode::Auto && !usb));
+  const bool allowed = !gSleepPosterPreview && !usbGrace && !transfer && (gLsMode == LsMode::On || (gLsMode == LsMode::Auto && !usb));
   // Wake on touch: a press means the user is here; stay fully awake for a
   // minute so the phone can (re)connect and everything feels instant.
   // Only while DISCONNECTED: its job is to let the phone in. While connected
@@ -1444,6 +1459,7 @@ static void lightSleepTick() {
 #endif
 
 static void checkAutoSleep() {
+  if (gSleepPosterPreview) return;
 #if XP_AUTO_SLEEP_MS > 0
   static unsigned long lastInputMs = 0;
   const unsigned long now = millis();
@@ -1599,6 +1615,67 @@ static int b64Decode(const char* in, uint8_t* out, int outMax) {
   return n;
 }
 
+#if defined(FLOWE_BENCH_COMPACT)
+// Keep diagnostic stack and allocations OUTSIDE pumpDevConsole: that pump
+// also runs from HTTP cancellation callbacks with a small remaining stack.
+static __attribute__((noinline)) void benchCodecCommand(const char* line) {
+  if (transfer_sync::active() || transfer_sync::handlingHttp() || gCurrentSceneId != SceneId::Launcher) {
+    Serial.println("[codec] run from launcher outside a transfer"); return;
+  }
+  unsigned profile = 0, first = 0, count = 0; int consumed = 0;
+  if (sscanf(line + 6, "%u %u %u %n", &profile, &first, &count, &consumed) != 3 ||
+      !consumed || !count || count > 64 || first > 65535 || strncmp(line + 6 + consumed, "/books/", 7)) {
+    Serial.println("[codec] usage: codec <profile0> <page0> <count1..64> /books/<file>"); return;
+  }
+  SCENES.waitFlushIdle();
+  std::unique_ptr<reader::FbpBook> book(new (std::nothrow) reader::FbpBook);
+  if (!book) { Serial.println("[codec] no memory for reader"); return; }
+  uint16_t width = 0, height = 0;
+  const uint32_t openAt = micros();
+  if (!book->open(line + 6 + consumed) || !book->benchProfile(profile, &width, &height) || first >= book->pageCount()) {
+    Serial.println("[codec] open failed"); return;
+  }
+  const auto savedOrientation = gfx.orientation();
+  gfx.setOrientation(width > height ? Gfx::Orient::Landscape : Gfx::Orient::Portrait);
+  if ((width != gfx.width() && !(width + Scene::SOFTKEY_BAR_H == gfx.width() && width > height)) || height != gfx.height()) {
+    gfx.setOrientation(savedOrientation); Serial.println("[codec] geometry mismatch"); return;
+  }
+  Serial.printf("[codec] begin profile=%u pages=%u open_us=%lu heap=%u probe_bytes=%u word_scratch=%u\n", profile, book->pageCount(),
+                (unsigned long)(micros() - openAt), ESP.getFreeHeap(), (unsigned)sizeof(reader::FbpBook),
+                (unsigned)(256 * sizeof(reader::FbpBook::WordBox)));
+  for (uint32_t pg = first; pg < first + count && pg < book->pageCount(); pg++) {
+    uint32_t bodyCrc = 0, t = micros();
+    bool bodyOk = book->benchBodyCrc((uint16_t)pg, &bodyCrc);
+    uint32_t decodeUs = micros() - t;
+    gfx.clear(); t = micros();
+    bool drawn = book->renderPage(gfx, (uint16_t)pg);
+    uint32_t composeUs = micros() - t;
+    const uint8_t* fb = display.getFrameBuffer();
+    const uint32_t bytes = (uint32_t)display.getDisplayWidthBytes() * display.getDisplayHeight();
+    const uint32_t pixels = fb ? bench::crc32(fb, bytes) : 0;
+    auto* words = (reader::FbpBook::WordBox*)malloc(256 * sizeof(reader::FbpBook::WordBox));
+    if (!words) { Serial.println("[codec] no memory for word scratch"); break; }
+    const uint16_t nw = book->pageWords(words, 256); uint32_t wc = UINT32_MAX;
+    for (uint16_t w = 0; w < nw; w++) {
+      uint8_t fields[7] = {(uint8_t)words[w].x, (uint8_t)(words[w].x >> 8),
+        (uint8_t)words[w].w, (uint8_t)(words[w].w >> 8), words[w].line, words[w].flags, words[w].textLen};
+      char text[256]; book->wordText(words[w], text, sizeof(text));
+      wc = fc_crc_bytes(wc, fields, sizeof(fields));
+      wc = fc_crc_bytes(wc, (const uint8_t*)text, words[w].textLen);
+    }
+    free(words);
+    Serial.printf("[codec] page=%lu ok=%u body=%08lx pixels=%08lx words=%u word_crc=%08lx decode_us=%lu compose_us=%lu peak=%lu heap=%u\n",
+      (unsigned long)pg, bodyOk && drawn, (unsigned long)bodyCrc, (unsigned long)pixels, nw,
+      (unsigned long)~wc, (unsigned long)decodeUs, (unsigned long)composeUs,
+      (unsigned long)book->lastPeakBytes(), ESP.getFreeHeap());
+    yield();
+  }
+  // Leave the last page in RAM for `fb` and `flushtier full`. The caller
+  // uses `redraw` when finished; no automatic flush enters the timing.
+  Serial.println("[codec] end");
+}
+#endif
+
 static void pumpDevConsole() {
   if (!usbHostConnected()) return;
   static char line[256];  // was 32; the file-put chunks and long Wi-Fi passwords need room
@@ -1613,6 +1690,22 @@ static void pumpDevConsole() {
     const uint8_t had = len;
     len = 0;
     if (had == 0) continue;
+    if (transfer_sync::active() || transfer_sync::handlingHttp()) {
+      if (!strcmp(line, "reboot") || !strcmp(line, "wakeboot") ||
+          !strcmp(line, "sync stop") || !strcmp(line, "btn back") || !strcmp(line, "btn back long")) {
+        transfer_sync::requestCancel();
+        continue;
+      }
+      const bool allowed = !strcmp(line, "where") || !strcmp(line, "netmem") || !strcmp(line, "heapdump") ||
+                           (!transfer_sync::handlingHttp() && !strcmp(line, "fb"));
+      if (!allowed) {
+        Serial.println("[syncmem] static sync display; use sync stop or btn back to cancel");
+        continue;
+      }
+    }
+#if defined(FLOWE_BENCH_SD_WRITE)
+    if (bench::handleSdWriteCommand(line)) continue;
+#endif
     // Bench: set the device clock without the phone. The hardware has no
     // RTC and the date arrives over BLE, so every date-dependent screen
     // (streaks, the month strip, "today") was unverifiable on the bench
@@ -1645,6 +1738,9 @@ static void pumpDevConsole() {
       readerShelfDump();
       continue;
     }
+#if defined(FLOWE_BENCH_COMPACT)
+    if (!strncmp(line, "codec ", 6)) { benchCodecCommand(line); continue; }
+#endif
     if (!strcmp(line, "arenaoff")) {
       // Bench: prove the never-blank render path (glyphs read per use).
       extern bool benchSetNoArena(bool);
@@ -2236,6 +2332,16 @@ static void pumpDevConsole() {
       showFileTransferAutoStart();
       continue;
     }
+    if (!strcmp(line, "stafb")) {
+      // Bench: a session with NO target but the hotspot fallback allowed —
+      // the shape a phone sends when its OS withholds the network name.
+      // With 'isolate on' this walks the rescue that used to be missing:
+      // served, nobody knocked, become the hotspot anyway. (2026-09-10)
+      COMPANION_BLE.setTransferHotspotFallback(true);
+      Serial.println("[xphone-os] devcon: stafb (no target, hotspot fallback allowed)");
+      showFileTransferAutoStart();
+      continue;
+    }
     if (!strcmp(line, "stainplace")) {
       // Bench: the phone-started shape of a session (in place, the sync bar
       // over the current scene, restart back to it at the end) without a
@@ -2244,6 +2350,25 @@ static void pumpDevConsole() {
       showFileTransferAutoStartInPlace(/*direct=*/false);
       continue;
     }
+#if defined(FLOWE_TRANSFER_MEMORY_PROBE)
+    if (!strcmp(line, "netguest")) {
+      // Bench-only: exercise a failed guest download without ending STA.
+      // Production session tokens still come from the paired phone over BLE.
+      extern void transferSetSessionToken(const char* token, bool ownedReadiness);
+      if (gTransferMemoryLocal) transferSetSessionToken("bench-guest-cleanup", true);
+      continue;
+    }
+    if (!strcmp(line, "alloctest")) {
+      allocationProbeSelfTest();
+      continue;
+    }
+    if (!strcmp(line, "netmem")) {
+      // TCP/IP may not exist before the first Wi-Fi session of this boot.
+      if (gTransferMemoryLocal) transferNetworkMemoryProbe();
+      else Serial.println("[netmem] start a transfer server before this probe");
+      continue;
+    }
+#endif
     if (!strcmp(line, "heapdump")) {
       // Bench: walk every heap block into a buffer, then print. Printing
       // inside the walk is impossible: the heap lock is held there and the
@@ -2396,12 +2521,18 @@ static void pumpDevConsole() {
       continue;
     }
     if (!strcmp(line, "poster off")) {
-      // Bench: show the OFF poster (inverted) without sleeping, held like a
-      // nap so the frame buffer can be grabbed; a power tap wakes.
+      // Bench: hold the sleep poster while fully awake for camera and
+      // framebuffer checks. Use wakeboot to leave the preview.
       Serial.println("[xphone-os] devcon: poster off (held, no sleep)");
       if (!gNapping && gCurrentSceneId != SceneId::FileTransfer) {
         SCENES.waitFlushIdle();
         gNapScene = gCurrentSceneId;
+        gSleepPosterPreview = true;
+        gNapOnUsb = usbHostConnected();
+        snapshotNapRevisions();
+        gNapChangeAtMs = 0;
+        gNapCleanAtMs = 0;
+        gNapPosterUpdates = 0;
         Sleep::drawSleepScreenNow(gfx, /*napping=*/false);
         SCENES.setPaused(true);
         gNapping = true;
@@ -2414,6 +2545,11 @@ static void pumpDevConsole() {
       if (line[0] == 'n') gNapAfterMsOverride = s; else gOffAfterMsOverride = s;
       Serial.printf("[xphone-os] devcon: %s %lu ms\n", line[0] == 'n' ? "napafter" : "offafter", (unsigned long)s);
       continue;
+    }
+    if (!strcmp(line, "quietrestart")) {
+      // Bench: the restart that ends a sync, on the current scene.
+      Serial.println("[xphone-os] devcon: quietrestart");
+      quietRestartToScene(static_cast<uint32_t>(gCurrentSceneId));
     }
     if (!strcmp(line, "wakeboot")) {
       // Bench: restart as if waking from deep sleep (no splash), leaving the
@@ -2469,6 +2605,20 @@ static void pumpDevConsole() {
   }
 }
 
+// Poll only control input during blocking HTTP work. Never call a scene or
+// tear a server down under its own callback. Back is latched by the input
+// task, so even a short press between network chunks is kept.
+bool transfer_sync::pollControls() {
+  static uint32_t lastPoll = 0;
+  if (millis() - lastPoll >= 20) {
+    lastPoll = millis();
+    pumpDevConsole();
+    input.update();
+    if (input.wasPressed(Btn::Back) || input.wasLongPressed(Btn::Back)) requestCancel();
+  }
+  return cancelRequested();
+}
+
 // Loop task stack: 10 KB, not the core's 8 KB (2026-09-07). The probe above
 // showed the task at 1756 B free in normal running (BLE start, the connect
 // handling, and the reader.progress send each step it down), the transfer
@@ -2482,6 +2632,14 @@ void loop() {
   stallwatch::beat();       // "the loop is alive"; a stuck loop stops ticking
   pumpDevConsole();         // bench-only: serial "btn X" -> synthetic taps
   input.update();           // debounced button edges (SDK InputManager)
+  if (transfer_sync::active()) {
+    // Static sync owns the glass. USB and physical cancel remain active;
+    // no power/sleep paint or queued BLE scene switch may borrow its RAM.
+    SCENES.loop(input, gfx);
+    reportRuntimeStats();
+    delay(10);
+    return;
+  }
   checkPowerButton();       // press+release -> deep sleep; hold ~2.5s -> restart
   checkAutoSleep();         // M4: idle -> deep sleep (2 min window while a block is active)
   pumpCompanionEvents();         // BLE/ANCS: parse queued payloads, set dirty flags
@@ -2491,6 +2649,7 @@ void loop() {
   if (gNapping) {
     if (gCurrentSceneId != gNapScene) {
       gNapping = false;  // a phone-started session switched scenes; it paints itself
+      gSleepPosterPreview = false;
       SCENES.setPaused(false);
     } else {
       // Only the power button wakes a nap (Andrew, 2026-09-05): one rule for
@@ -2509,6 +2668,7 @@ void loop() {
     }
   }
   if (sceneLoop) SCENES.loop(input, gfx);  // handle input; repaint only when a scene is dirty
+  if (transfer_sync::active()) { reportRuntimeStats(); delay(10); return; }
   reportRuntimeStats();          // M2.1d: 60s stack/heap/ANCS-queue audit line
   powerbench::pump();            // lane 9: gauge sampler, no-op unless armed
   if (gBleDropAtMs && static_cast<int32_t>(millis() - gBleDropAtMs) >= 0) {

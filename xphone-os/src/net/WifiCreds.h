@@ -52,6 +52,13 @@ bool peekFailure(char* ssid, size_t ssidSize, int* reason);  // read only (the d
 // password), persisted in NVS, exchanged only over encrypted BLE
 // (wifi.known "ap"). Never typed, never shown by default (Q3).
 void apCredentials(char* ssid, size_t ssidSize, char* pass, size_t passSize);
+// Actual SoftAP hardware address, available before Wi-Fi starts.
+bool apBssid(char* out, size_t outSize);
+
+// Same stable, full hardware identity over BLE and HTTP, independent of the
+// current Wi-Fi mode. Routing identity only; session tokens still authorize.
+constexpr size_t kReaderIdSize = 13;  // 12 uppercase hex digits + NUL
+bool readerId(char* out, size_t outSize);
 
 // ---- legacy single-network API (shims over the store) ----
 bool load(char* ssid, size_t ssidSize, char* password, size_t passwordSize);

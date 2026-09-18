@@ -283,6 +283,14 @@ class ReaderScene : public Scene {
   static constexpr uint16_t kMaxPageWords = 400;
   bool _wcMode = false;
   bool _wcSheet = false;
+#ifdef FLOWE_PREPARED_GUIDE
+  bool _wcGuide = false;
+  bool _guideBound = false;
+  uint8_t _guideHash[32] = {};
+  uint32_t _guideCid = 0;
+  void openWordGuide();
+  void renderWordGuide(Gfx& gfx);
+#endif
   bool _wcNeedLoad = false;   // words load in render(), after the page draws
   int8_t _wcPendingEdge = 0;  // +1: land on the first word, -1: on the last
   bool _wcNote = false;       // pre-v8 book: the row's value column explains

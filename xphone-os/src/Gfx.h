@@ -66,6 +66,9 @@ class Gfx {
   // Cache framebuffer + geometry. Call after display.begin(); false if the
   // SDK returned no framebuffer.
   bool begin();
+  // Flush must be idle and all scene caches discarded before this call.
+  bool releaseFramebufferForSync();
+  bool restoreFramebufferAfterSync();
 
   int width() const { return _w; }
   int height() const { return _h; }

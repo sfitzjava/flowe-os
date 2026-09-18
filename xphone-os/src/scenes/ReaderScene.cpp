@@ -74,6 +74,9 @@
 #include "../reader/ReaderSmokeTest.h"
 #endif
 #include "AppScenes.h"
+#ifdef FLOWE_PREPARED_GUIDE
+#include "../PreparedReaderGuide.h"
+#endif
 
 namespace {
 
@@ -428,6 +431,7 @@ void ReaderScene::suspendRadioForBookWork() {
 }
 
 void ReaderScene::onExit() {
+  _fbForLoan = nullptr;  // no framebuffer borrow may survive this scene
   // Capture the pagination BEFORE the book state is torn down below, for the
   // place we hand the phone at the end (item 6 step 3).
   const uint16_t exitPageCount = _fbp ? (uint16_t)_fbp->pageCount() : _lastPageCount;
@@ -550,6 +554,10 @@ const char* const* ReaderScene::softKeys() const {
   static constexpr const char* kWordPick[4] = {"BACK", "GO", SoftKey::Left, SoftKey::Right};
   static constexpr const char* kWordPickL[4] = {"BACK", "GO", SoftKey::Right, SoftKey::Left};
   static constexpr const char* kWordSheet[4] = {"BACK", "GO", nullptr, nullptr};
+#ifdef FLOWE_PREPARED_GUIDE
+  static constexpr const char* kGuideSheet[4] = {"BACK", "READ", nullptr, nullptr};
+  if (_state == State::Reading && _wcMode && _wcSheet && _wcGuide) return kGuideSheet;
+#endif
   switch (_state) {
     case State::Reading:
       if (_hlMode) return kHlPick;
@@ -640,6 +648,10 @@ void ReaderScene::failWith(const char* msg) {
 }
 
 void ReaderScene::workOpenBook() {
+#ifdef FLOWE_PREPARED_GUIDE
+  // A cached byte identity and word boxes belong to one open book only.
+  _guideBound = _wcGuide = _wcMode = _wcSheet = false;
+#endif
   // Leaving the grid: hand the ~58KB cover-decoder scratch back to the heap
   // before anything else claims it.
   reader::CoverThumb::releaseScratch();
@@ -946,6 +958,9 @@ void ReaderScene::acceptGoto(const char* key, uint32_t cid) {
     if (strcmp(openKey, key) == 0) {
       const uint16_t page = _fbp->pageForContentId(cid);
       if (page != _fbpPage) {
+#ifdef FLOWE_PREPARED_GUIDE
+        _wcGuide = _wcMode = _wcSheet = false;
+#endif
         _fbpPage = page;
         reader::FbpBook::savePos(_bookPath.c_str(), _fbpPage, _fbp->pageCount());
       }
@@ -1110,6 +1125,9 @@ static int menuRows(bool isFbp, bool landscapeReady, bool notesHere, MenuRow* ou
 }
 
 uint8_t ReaderScene::longPressSlots() const {
+#ifdef FLOWE_PREPARED_GUIDE
+  if (_state == State::Reading && _wcMode && !_wcSheet) return 0x02;
+#endif
   // The only long press in the reader a person could not guess: hold GO on a
   // bookmark to delete it. Everything else the labels already say.
   if (_state == State::Reading && _menu == MenuView::Bookmarks && _markCount > 0) return 0x02;
@@ -1617,6 +1635,10 @@ void ReaderScene::enterWordMode() {
   if (!_fbp || !_fbp->hasWordBoxes()) return;
   _wcMode = true;
   _wcSheet = false;
+#ifdef FLOWE_PREPARED_GUIDE
+  _wcGuide = false;
+  _guideBound = false;
+#endif
   _wcNeedLoad = true;
   _wcPendingEdge = 0;
   _wcCount = 0;
@@ -1739,6 +1761,14 @@ int ReaderScene::wordNoteIndex() {
 }
 
 void ReaderScene::handleWordInput(Input& in) {
+#ifdef FLOWE_PREPARED_GUIDE
+  if (_wcSheet && _wcGuide) {
+    if (in.wasPressed(Btn::Back)) { _wcGuide = _wcSheet = false; markDirty(); }
+    else if (in.wasPressed(Btn::Confirm)) { _wcGuide = _wcSheet = _wcMode = false; markDirty(); }
+    return;
+  }
+  if (!_wcSheet && in.wasLongPressed(Btn::Confirm)) { openWordGuide(); return; }
+#endif
   if (_wcSheet) {
     if (in.wasPressed(Btn::Back)) {
       _wcSheet = false;
@@ -1806,6 +1836,48 @@ void ReaderScene::handleWordInput(Input& in) {
   else if (fwdKey(in)) wordMove(+1);
 }
 
+#ifdef FLOWE_PREPARED_GUIDE
+void ReaderScene::openWordGuide() {
+  if (!_fbp || !_wcCount || _wcIdx < 0 || _wcIdx >= _wcCount) return;
+  SCENES.waitFlushIdle();
+  CpuBoost boost;
+  _fbp->wordText(_wcWords[_wcIdx], _wcWord, sizeof(_wcWord));
+  char key[64]; reader::FbpBook::canonicalKey(baseName(_bookPath.c_str()), key, sizeof(key));
+  const uint32_t before = _fbp->lineCid(_wcWords[_wcIdx].line);
+  const auto result = prepared_reader::lookup(_bookPath.c_str(), key, _wcWord, before,
+      _guideHash, _guideBound, _guideCid, _wcDef, sizeof(_wcDef));
+  _wcDefFound = result == prepared_reader::Result::Found;
+  if (!_wcDefFound) {
+    const char* message = result == prepared_reader::Result::Missing ? "No prepared guide for this book."
+        : result == prepared_reader::Result::Invalid ? "This guide is incomplete or belongs to a different book."
+        : result == prepared_reader::Result::UnsupportedWord ? "This test supports single English words."
+        : "No earlier passage for this word in the prepared guide.";
+    snprintf(_wcDef, sizeof(_wcDef), "%s", message);
+  }
+  _wcGuide = _wcSheet = true;
+  Serial.printf("[reader-guide] view result=%u page=%u word=%d before=%lu\n", (unsigned)result, _fbpPage, _wcIdx, (unsigned long)before);
+  markDirty();
+}
+
+void ReaderScene::renderWordGuide(Gfx& gfx) {
+  const int w = contentRight(gfx, 0), h = gfx.height();
+  gfx.clear();
+  gfx.drawText(kFontBold, 24, 35, "Book guide");
+  char shown[64]; truncateToWidth(gfx, kFontBold, _wcWord, w-48, shown, sizeof(shown));
+  gfx.drawText(kFontBold, 24, 100, shown);
+  char label[64];
+  if (_wcDefFound) snprintf(label, sizeof(label), "Earlier passage / source %lu", (unsigned long)_guideCid);
+  else snprintf(label, sizeof(label), "No passage available");
+  gfx.drawText(kFontSmall, 24, 147, label);
+  gfx.fillRect(24, 187, w-48, 2, true);
+  const int lines = (h-135-218) / gfx.lineHeight(kFontRegular);
+  gfx.drawTextWrapped(kFontRegular, 24, 218, _wcDef, w-48, lines>0?lines:1);
+  gfx.fillRect(24, h-115, w-48, 2, true);
+  gfx.drawText(kFontSmall, 24, h-97, "Source text prepared on your phone.");
+  gfx.drawText(kFontSmall, 24, h-68, "BACK: selected word   READ: same page");
+}
+#endif
+
 void ReaderScene::renderWordCursor(Gfx& gfx) {
   const int w = contentRight(gfx, 0);
   if (_wcCount > 0 && _wcIdx < (int)_wcCount) {
@@ -1818,6 +1890,10 @@ void ReaderScene::renderWordCursor(Gfx& gfx) {
     gfx.drawRect(b.x - 3, top, b.w + 6, h, 2, true);
   }
   // The band: what the keys do here, and the word under the cursor.
+#ifdef FLOWE_PREPARED_GUIDE
+  gfx.fillRect(0, gfx.height()-58, w, 32, false);
+  gfx.drawText(kFontSmall, 24, gfx.height()-56, "Hold GO for book guide");
+#endif
   const int capH = gfx.capHeight(kFontSmall);
   const int capOff = gfx.capTopOffset(kFontSmall);
   const int bandMid = gfx.height() - 12;
@@ -1832,6 +1908,9 @@ void ReaderScene::renderWordCursor(Gfx& gfx) {
 }
 
 void ReaderScene::renderWordSheet(Gfx& gfx) {
+#ifdef FLOWE_PREPARED_GUIDE
+  if (_wcGuide) { renderWordGuide(gfx); return; }
+#endif
   const int w = contentRight(gfx, 0);
   const int note = wordNoteIndex();
   // A found entry gets the lower half of the page; the other cases a strip.
@@ -2655,7 +2734,14 @@ void ReaderScene::sizeStep(const int dir) {
     // buffer would not fit the heap) leaves the current size applied and
     // the page intact — FbpBook::stepSize rolls itself back.
     uint16_t np = _fbpPage;
-    if (!_fbp->profileSelected() || !_fbp->stepSize(dir, _fbpPage, &np)) return;
+    if (!_fbp->profileSelected()) return;
+    if (!_fbp->stepSize(dir, _fbpPage, &np)) {
+      // Rollback reloads the dictionary, not the page. Render again so the
+      // visible page and its word cursors agree. A failed rollback leaves the
+      // profile unselected and renderFbp retries through its normal error path.
+      markDirty();
+      return;
+    }
     _fbpPage = np;
     reader::FbpBook::savePos(_bookPath.c_str(), _fbpPage, _fbp ? _fbp->pageCount() : 0);
     streamPos();
@@ -3552,6 +3638,7 @@ bool ReaderScene::applyOrientation(Gfx& gfx, const bool toLandscape, const bool 
     }
   } else if (!_fbp->selectProfileFresh(wantW, wantH)) {
     gfx.setOrientation(before);
+    markDirty();  // rollback reloads the dictionary; restore the page and words
     return false;  // package has no profile there — stay put
   }
 
@@ -5145,6 +5232,15 @@ void ReaderScene::debugWhere(char* out, const size_t n) const {
       snprintf(out, n, "%s sel=%d/%d win=%d", _doneView ? "shelf:done" : "shelf", _sel, _totalBooks, _windowOffset);
       return;
     case State::Reading: {
+#ifdef FLOWE_PREPARED_GUIDE
+      if (_wcMode) {
+        char word[48] = {};
+        if (_fbp && _wcCount && _wcIdx >= 0 && _wcIdx < _wcCount) _fbp->wordText(_wcWords[_wcIdx], word, sizeof(word));
+        snprintf(out, n, "reading '%s' page=%u word-%s idx=%d/%u word=%s", baseName(_bookPath.c_str()), _fbpPage,
+            _wcSheet ? (_wcGuide ? "guide" : "sheet") : "cursor", _wcIdx, _wcCount, word);
+        return;
+      }
+#endif
       // menuSel and the orientation are here so a bench sweep can navigate by
       // fact: without them every menu drive is dead reckoning from whatever
       // the cursor happened to be, and the direction keys swap in landscape.

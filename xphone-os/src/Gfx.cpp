@@ -13,6 +13,19 @@ bool Gfx::begin() {
   return _fb != nullptr && _w > 0 && _h > 0;
 }
 
+bool Gfx::releaseFramebufferForSync() {
+  _fb = nullptr;  // invalidate the borrowed pointer BEFORE the SDK frees it
+  if (_d.releaseFramebufferForSync()) return true;
+  _fb = _d.getFrameBuffer();  // unsupported/static path keeps normal drawing
+  return false;
+}
+
+bool Gfx::restoreFramebufferAfterSync() {
+  if (!_d.restoreFramebufferAfterSync()) return false;
+  _fb = _d.getFrameBuffer();
+  return _fb != nullptr;
+}
+
 // Swap the logical frame. Landscape == the panel's native orientation, so
 // the transform becomes the identity; portrait keeps the 90 CW rotation.
 // Callers must repaint after switching (every layout depends on w/h).
@@ -31,6 +44,7 @@ void Gfx::setOrientation(const Orient o) {
 }
 
 void Gfx::drawPixel(const int x, const int y, const bool black) {
+  if (!_fb) return;
   if (x < 0 || y < 0 || x >= _w || y >= _h) return;
   if (_orient == Orient::Landscape) {
     // Native orientation: logical == physical, no rotation.
@@ -90,6 +104,7 @@ void Gfx::drawLine(int x0, int y0, const int x1, const int y1, const int thickne
 }
 
 void Gfx::fillRect(const int x, const int y, const int w, const int h, const bool black) {
+  if (!_fb) return;
   // M2.1a byte-run fill. Transform is IDENTICAL to drawPixel (phyX = y,
   // phyY = _w - 1 - x): one logical COLUMN is one native framebuffer row, and
   // the logical-Y run inside it is the native bit/byte axis — so each column
@@ -262,6 +277,7 @@ const EpdGlyph* Gfx::findGlyph(const XpFont& f, const uint32_t cp) const {
 }
 
 void Gfx::blitGlyph(const XpFont& f, const EpdGlyph* g, const int penX, const int lineTopY, const bool black) {
+  if (!_fb) return;
   // Same packing as GfxRenderer renderCharImpl (1bpp branch): MSB-first bits,
   // pixelPosition = glyphY * width + glyphX, no per-row padding.
   //

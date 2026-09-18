@@ -211,9 +211,15 @@ class CompanionBleService final {
   // phone-hotspot rung a session-only password. Empty ssid = the old walk
   // over every saved network (old apps, the bench `sta`). Copied out by
   // the scene with takeTransferTarget().
-  bool takeTransferTarget(char* ssid, size_t ssidSize, char* pass, size_t passSize);
+  // `hotspotFallback` comes back true when the phone said it could not name
+  // its network; read and cleared with the target so the two cannot drift.
+  bool takeTransferTarget(char* ssid, size_t ssidSize, char* pass, size_t passSize,
+                          bool* hotspotFallback = nullptr);
   // Bench: devcon 'sta <ssid>' plants a target as if the phone had named it.
   void setTransferTarget(const char* ssid, const char* pass);
+  // Bench: devcon 'stafb' plants the "I could not name my network" flag with
+  // no target, the shape a phone sends when its OS withholds the name.
+  void setTransferHotspotFallback(bool on);
   bool consumeShelfRequest();
   // Same latch, for reading progress + stats.
   bool consumeProgressRequest();
@@ -325,6 +331,12 @@ class CompanionBleService final {
   char pendingTransferDetail[40] = {0};
   char transferTargetSsid[64] = {0};
   char transferTargetPass[64] = {0};
+  // "fallback": the phone is on Wi-Fi but its OS would not name the network,
+  // so it cannot give us a target. Walk the saved list as before, but treat
+  // an unreachable session the way a named target does and raise the hotspot
+  // rather than fail. Without this the hotspot is unreachable on BOTH sides
+  // at once whenever the name is withheld. (2026-09-10)
+  bool transferHotspotFallback = false;
 
   // Raw card JSON queued by handleCardWrite(). A small FIFO, not a single
   // slot: multi-part priorities snapshots arrive one GATT write per

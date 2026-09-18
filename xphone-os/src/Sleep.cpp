@@ -148,26 +148,16 @@ void composeSleepScreen(Gfx& gfx, const bool napping) {
 
     PrioritiesScene::renderDormantWakeHint(gfx, napping);
   }
-  // Ghost scrub: auto-sleep fires after minutes of an unchanged, differential-
-  // refreshed image, and one FULL inversion pass can leave a faint imprint of
-  // it behind the dormant frame. Boot conditioning runs TWO full syncs for the
-  // same reason (Uc8253X3Driver::begin, _initialFullSyncsRemaining = 2), so
-  // mirror it here: requestResync(1) makes this FULL run as a forced full sync
-  // plus one post-condition pass with the OEM _normal bank. No-op on X4.
-  // Two kinds of sleep (Andrew, 2026-09-05, "lights out"): a nap keeps the
-  // light poster with its live content and a "still connected" dot; OFF is
-  // the same poster inverted, white on black, so the two rest states are
-  // told apart from across the room and in the dark. The content stays on
-  // both: it is useful.
-  if (!napping) gfx.invert();
+  // Nap and sleep share the light poster. The larger moon and bold "asleep"
+  // footer mark deep sleep without changing the background or useful content.
 }
 
 void drawSleepScreen(Gfx& gfx, const bool napping) {
   composeSleepScreen(gfx, napping);
   gLastPosterFingerprint = napping ? frameFingerprint(gfx) : 0;
   // Through the flush task (no light-sleep slice mid-waveform). OFF is the
-  // deep, clean state and takes the FULL: the inverted poster wants the
-  // strongest black. A nap is quick and reversible: on the X4 it takes the
+  // deep, clean state and takes the FULL before the panel powers down.
+  // A nap is quick and reversible: on the X4 it takes the
   // warmed HALF clean (1.9 s, the vendor's everyday full clean; the true FULL
   // there runs 3.9 s). The X3's FULL is already 1.9 s and Andrew checked that
   // poster by hand (2026-09-05), so the X3 keeps it.
@@ -343,6 +333,133 @@ bool refreshNapPoster(Gfx& gfx) {
 void imuSleepAtBoot() { imuSleep(); }
 
 
+// The companion stores, written to NVS so the next boot re-seeds them.
+// Shared by the OFF path (sleepNow) and the quiet restart that ends a Wi-Fi
+// session or frees the reader's memory (persistStoresForRestart). Before
+// 2026-09-17 only sleepNow wrote these, so every quiet restart re-seeded
+// the list from the LAST POWER-OFF: a user's X3 showed old priorities on
+// its nap poster after every sync until the phone pushed the list again.
+static void persistStores(Preferences& prefs) {
+  // Last Today / Priorities snapshot JSON so the dormant/wake render shows
+  // cached data instead of the blank "Syncing" screen (seeded at boot).
+  const std::string& todayJson = COMPANION_BLE.getLastTodayCard();
+  if (!todayJson.empty()) prefs.putString(kTodayCardKey, todayJson.c_str());
+  // Priorities: serialized from the STORE, not the last phone card — a
+  // multi-part snapshot's final card only carries the tail slice, so the
+  // raw payload no longer represents the whole list.
+  if (PRIORITIES_STORE.count() > 0) {
+    JsonDocument doc;
+    doc["kind"] = "priorities.snapshot";
+    doc["id"] = "prio-persist";
+    doc["body"] = PRIORITIES_STORE.syncLine();
+    JsonArray items = doc["priorityItems"].to<JsonArray>();
+    PrioritiesStore::Item it;
+    for (std::size_t i = 0; PRIORITIES_STORE.get(i, it); i++) {
+      JsonArray row = items.add<JsonArray>();
+      row.add(it.id);
+      row.add(it.title);
+      row.add(it.note);
+      row.add(it.done);
+    }
+    String out;
+    serializeJson(doc, out);
+    prefs.putString(kPrioCardKey, out);
+  }
+
+  // Workout snapshot: serialized from the STORE, not the last phone card —
+  // sets counted while the phone was away live only in the store, and the
+  // wake seed must not regress them.
+  if (WORKOUT_STORE.count() > 0) {
+    JsonDocument doc;
+    doc["kind"] = "workout.snapshot";
+    doc["id"] = "workout-persist";
+    doc["workoutDate"] = WORKOUT_STORE.date();
+    JsonArray items = doc["workoutItems"].to<JsonArray>();
+    WorkoutStore::Item it;
+    for (std::size_t i = 0; WORKOUT_STORE.get(i, it); i++) {
+      JsonArray row = items.add<JsonArray>();
+      row.add(it.id);
+      row.add(it.name);
+      row.add(it.sets);
+      row.add(it.done);
+    }
+    String out;
+    serializeJson(doc, out);
+    prefs.putString(kWorkoutCardKey, out);
+  }
+
+  // Newest notifications (shared persistence scratch, declared above).
+  {
+    const std::size_t n = NOTIFICATION_STORE.snapshot(gNotifScratch, sizeof(gNotifScratch));
+    if (n > 0) prefs.putBytes(kNotifStoreKey, gNotifScratch, n);
+    else prefs.remove(kNotifStoreKey);  // do not resurrect a list cleared since the last sleep
+
+    // Individual-clear tombstones are a separate raw blob so changing the
+    // notification snapshot policy cannot discard the replay retry memory.
+    const std::size_t tombN = NOTIFICATION_STORE.tombstoneSnapshot(gTombScratch, sizeof(gTombScratch));
+    if (tombN > 0) prefs.putBytes(kNotifTombKey, gTombScratch, tombN);
+    else prefs.remove(kNotifTombKey);
+  }
+}
+
+void persistStoresForRestart() {
+  Preferences prefs;
+  if (!prefs.begin(kPrefsNamespace, /*readOnly=*/false)) {
+    Serial.println("[xphone-os] restart: NVS open failed; stores not persisted");
+    return;
+  }
+  persistStores(prefs);
+  prefs.end();
+  Serial.printf("[xphone-os] restart: stores persisted (priorities=%u today=%s workout=%u)\n",
+                static_cast<unsigned>(PRIORITIES_STORE.count()),
+                COMPANION_BLE.getLastTodayCard().empty() ? "no" : "yes",
+                static_cast<unsigned>(WORKOUT_STORE.count()));
+}
+
+void requestFreshCardsNow() {
+  // 0. Best-effort priorities refresh so the dormant frame holds TONIGHT's
+  //    list: the iPhone never pushes a snapshot unsolicited (it only answers
+  //    priorities.sync.request / priority.toggle, or the user taps "Send to
+  //    X4"), so ask now and wait for the reply. Because resync is now
+  //    scene-scoped (only the on-glass scene's rail syncs on connect), the
+  //    priorities store is often empty here if the user never opened the
+  //    Priorities app this session — so this pre-sleep fetch is the ONLY way
+  //    the dormant frame gets a list. The wait must pump processPending()
+  //    itself — card JSON parses ONLY on the main loop (handleCardWrite just
+  //    stashes raw bytes) and this function never returns to loop(). The
+  //    ceiling is 3500 ms (not 1500): a round trip on the low-duty link
+  //    (180 ms interval, slave latency 4) is two connection events ~= 1.8 s+
+  //    plus the phone's processing, so 1500 ms often missed. It BREAKS EARLY
+  //    the moment the snapshot lands, so the common case still sleeps fast;
+  //    3500 ms is just the ceiling for a slow link. Phone disconnected ->
+  //    skip; no reply in time -> render whatever the store holds (empty ->
+  //    wordmark fallback).
+  if (COMPANION_BLE.isConnected()) {
+    const uint32_t rev0 = PRIORITIES_STORE.revision();
+    if (COMPANION_BLE.sendPrioritiesSyncRequest()) {
+      const unsigned long tRequest = millis();
+      while (millis() - tRequest < 300UL) {  // 2026-09-05: the phone already pushed these on connect; 1500 timed out twice on the 180 ms link = 3 s of dead time before the sleep screen
+        COMPANION_BLE.processPending();
+        if (PRIORITIES_STORE.revision() != rev0) break;  // fresh snapshot landed
+        delay(25);
+      }
+    }
+    // M5: same best-effort refresh for the Today snapshot — the footer shows
+    // the NEXT calendar event, so it must be as fresh as the priorities list.
+    // Sent AFTER the priorities reply (or its timeout): both commands notify
+    // on the shared action characteristic, and back-to-back notifies clobber.
+    const uint32_t todayRev0 = TODAY_STORE.revision();
+    if (COMPANION_BLE.sendTodaySyncRequest()) {
+      const unsigned long tRequest = millis();
+      while (millis() - tRequest < 300UL) {  // 2026-09-05: the phone already pushed these on connect; 1500 timed out twice on the 180 ms link = 3 s of dead time before the sleep screen
+        COMPANION_BLE.processPending();
+        if (TODAY_STORE.revision() != todayRev0) break;  // fresh snapshot landed
+        delay(25);
+      }
+    }
+  }
+}
+
 void sleepNow(Gfx& gfx, Input& input) {
   // M5 Phase 1/2: the flush worker must be idle before this function's direct
   // panel paints, and the sampling task must stop before deep-sleep teardown
@@ -390,113 +507,14 @@ void sleepNow(Gfx& gfx, Input& input) {
       prefs.putInt(kBlkTotalKey, blk.total);
       prefs.putInt(kBlkMinKey, blk.minutesToday);
 
-      // Last Today / Priorities snapshot JSON so the dormant/wake render shows
-      // cached data instead of the blank "Syncing" screen (seeded at boot).
-      const std::string& todayJson = COMPANION_BLE.getLastTodayCard();
-      if (!todayJson.empty()) prefs.putString(kTodayCardKey, todayJson.c_str());
-      // Priorities: serialized from the STORE, not the last phone card — a
-      // multi-part snapshot's final card only carries the tail slice, so the
-      // raw payload no longer represents the whole list.
-      if (PRIORITIES_STORE.count() > 0) {
-        JsonDocument doc;
-        doc["kind"] = "priorities.snapshot";
-        doc["id"] = "prio-persist";
-        doc["body"] = PRIORITIES_STORE.syncLine();
-        JsonArray items = doc["priorityItems"].to<JsonArray>();
-        PrioritiesStore::Item it;
-        for (std::size_t i = 0; PRIORITIES_STORE.get(i, it); i++) {
-          JsonArray row = items.add<JsonArray>();
-          row.add(it.id);
-          row.add(it.title);
-          row.add(it.note);
-          row.add(it.done);
-        }
-        String out;
-        serializeJson(doc, out);
-        prefs.putString(kPrioCardKey, out);
-      }
-
-      // Workout snapshot: serialized from the STORE, not the last phone card —
-      // sets counted while the phone was away live only in the store, and the
-      // wake seed must not regress them.
-      if (WORKOUT_STORE.count() > 0) {
-        JsonDocument doc;
-        doc["kind"] = "workout.snapshot";
-        doc["id"] = "workout-persist";
-        doc["workoutDate"] = WORKOUT_STORE.date();
-        JsonArray items = doc["workoutItems"].to<JsonArray>();
-        WorkoutStore::Item it;
-        for (std::size_t i = 0; WORKOUT_STORE.get(i, it); i++) {
-          JsonArray row = items.add<JsonArray>();
-          row.add(it.id);
-          row.add(it.name);
-          row.add(it.sets);
-          row.add(it.done);
-        }
-        String out;
-        serializeJson(doc, out);
-        prefs.putString(kWorkoutCardKey, out);
-      }
-
-      // Newest notifications (shared persistence scratch, declared above).
-      {
-        const std::size_t n = NOTIFICATION_STORE.snapshot(gNotifScratch, sizeof(gNotifScratch));
-        if (n > 0) prefs.putBytes(kNotifStoreKey, gNotifScratch, n);
-        else prefs.remove(kNotifStoreKey);  // do not resurrect a list cleared since the last sleep
-
-        // Individual-clear tombstones are a separate raw blob so changing the
-        // notification snapshot policy cannot discard the replay retry memory.
-        const std::size_t tombN = NOTIFICATION_STORE.tombstoneSnapshot(gTombScratch, sizeof(gTombScratch));
-        if (tombN > 0) prefs.putBytes(kNotifTombKey, gTombScratch, tombN);
-        else prefs.remove(kNotifTombKey);
-      }
+      persistStores(prefs);
       prefs.end();
     } else {
       Serial.println("[xphone-os] sleep: NVS open failed; scene restore disabled this cycle");
     }
   }
 
-  // 0. Best-effort priorities refresh so the dormant frame holds TONIGHT's
-  //    list: the iPhone never pushes a snapshot unsolicited (it only answers
-  //    priorities.sync.request / priority.toggle, or the user taps "Send to
-  //    X4"), so ask now and wait for the reply. Because resync is now
-  //    scene-scoped (only the on-glass scene's rail syncs on connect), the
-  //    priorities store is often empty here if the user never opened the
-  //    Priorities app this session — so this pre-sleep fetch is the ONLY way
-  //    the dormant frame gets a list. The wait must pump processPending()
-  //    itself — card JSON parses ONLY on the main loop (handleCardWrite just
-  //    stashes raw bytes) and this function never returns to loop(). The
-  //    ceiling is 3500 ms (not 1500): a round trip on the low-duty link
-  //    (180 ms interval, slave latency 4) is two connection events ~= 1.8 s+
-  //    plus the phone's processing, so 1500 ms often missed. It BREAKS EARLY
-  //    the moment the snapshot lands, so the common case still sleeps fast;
-  //    3500 ms is just the ceiling for a slow link. Phone disconnected ->
-  //    skip; no reply in time -> render whatever the store holds (empty ->
-  //    wordmark fallback).
-  if (COMPANION_BLE.isConnected()) {
-    const uint32_t rev0 = PRIORITIES_STORE.revision();
-    if (COMPANION_BLE.sendPrioritiesSyncRequest()) {
-      const unsigned long tRequest = millis();
-      while (millis() - tRequest < 300UL) {  // 2026-09-05: the phone already pushed these on connect; 1500 timed out twice on the 180 ms link = 3 s of dead time before the sleep screen
-        COMPANION_BLE.processPending();
-        if (PRIORITIES_STORE.revision() != rev0) break;  // fresh snapshot landed
-        delay(25);
-      }
-    }
-    // M5: same best-effort refresh for the Today snapshot — the footer shows
-    // the NEXT calendar event, so it must be as fresh as the priorities list.
-    // Sent AFTER the priorities reply (or its timeout): both commands notify
-    // on the shared action characteristic, and back-to-back notifies clobber.
-    const uint32_t todayRev0 = TODAY_STORE.revision();
-    if (COMPANION_BLE.sendTodaySyncRequest()) {
-      const unsigned long tRequest = millis();
-      while (millis() - tRequest < 300UL) {  // 2026-09-05: the phone already pushed these on connect; 1500 timed out twice on the 180 ms link = 3 s of dead time before the sleep screen
-        COMPANION_BLE.processPending();
-        if (TODAY_STORE.revision() != todayRev0) break;  // fresh snapshot landed
-        delay(25);
-      }
-    }
-  }
+  requestFreshCardsNow();
 
   // 1. Sleep screen on glass first (FULL refresh) — everything after this is
   //    invisible teardown, so the device *feels* asleep immediately.
@@ -646,7 +664,11 @@ void seedPersistedBlock() {
   const String todayJson = prefs.getString(kTodayCardKey, "");
   if (todayJson.length() > 0) COMPANION_BLE.seedPersistedCard(std::string(todayJson.c_str()));
   const String prioJson = prefs.getString(kPrioCardKey, "");
-  if (prioJson.length() > 0) COMPANION_BLE.seedPersistedCard(std::string(prioJson.c_str()));
+  if (prioJson.length() > 0) {
+    COMPANION_BLE.seedPersistedCard(std::string(prioJson.c_str()));
+    Serial.printf("[xphone-os] boot: seeded %u persisted priorit%s\n",
+                  static_cast<unsigned>(PRIORITIES_STORE.count()), PRIORITIES_STORE.count() == 1 ? "y" : "ies");
+  }
   const String workoutJson = prefs.getString(kWorkoutCardKey, "");
   if (workoutJson.length() > 0) COMPANION_BLE.seedPersistedCard(std::string(workoutJson.c_str()));
 

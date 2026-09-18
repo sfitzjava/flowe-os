@@ -3,6 +3,7 @@
 #include <Arduino.h>
 
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <uzlib.h>
 #include <esp_heap_caps.h>
@@ -58,7 +59,7 @@ static void pageFail(const char* what, uint16_t page, size_t need) {
 }
 
 bool FbpBook::readAt(uint64_t off, void* dst, size_t n) {
-  if (!_f.seekSet(off)) return false;
+  if (off > _f.size() || n > _f.size() - off || !_f.seekSet(off)) return false;
   return _f.read(dst, n) == (int)n;
 }
 
@@ -72,8 +73,10 @@ bool FbpBook::open(const char* path) {
     close();
     return false;
   }
-  if (_hdr.fmt_ver < 3 || _hdr.min_reader > 5) {
-    Serial.printf("[xphone-os] fbp: format v%u (reader speaks v5) — recompile in the app\n",
+  if (_hdr.fmt_ver < 3 || _hdr.fmt_ver > 9 || _hdr.min_reader > 6 ||
+      (_hdr.fmt_ver == 9 && _hdr.min_reader != 6) ||
+      !_hdr.profile_count || _hdr.profile_count > FBP_PROFILE_CAP) {
+    Serial.printf("[xphone-os] fbp: format v%u (reader speaks v6) — recompile in the app\n",
                   _hdr.fmt_ver);
     close();
     return false;
@@ -169,8 +172,10 @@ uint16_t FbpBook::pageMarkCids(uint32_t* out, uint16_t cap) {
       if (p + 2 > end) return n;
       const uint8_t flags = *p++;
       const uint8_t tl = *p++;
-      if (p + tl > end) return n;
-      p += tl;
+      if (!_wordTextColumn) {
+        if (p + tl > end) return n;
+        p += tl;
+      }
       if ((flags & 2) && l < _lineCidCount) {
         const uint32_t cid = _lineCids[l];
         bool seen = false;
@@ -187,9 +192,12 @@ uint16_t FbpBook::pageMarkCids(uint32_t* out, uint16_t cap) {
 // bytes and carry no dictionary; v4 entries are 48. Reading a v3 file with
 // the v4 stride would walk off into the page records.
 bool FbpBook::readProfile(uint32_t i, ProfileDir* out) {
+  if (i >= _hdr.profile_count) return false;
   memset(out, 0, sizeof(*out));
-  if (_hdr.fmt_ver >= 4)
-    return readAt(sizeof(Header) + (uint64_t)i * sizeof(ProfileDir), out, sizeof(ProfileDir));
+  if (_hdr.fmt_ver >= 4) {
+    if (!readAt(sizeof(Header) + (uint64_t)i * sizeof(ProfileDir), out, sizeof(ProfileDir))) return false;
+    return _hdr.fmt_ver == 9 ? out->reserved[6] == FBP_COMPACT_CODEC : out->reserved[6] == 0;
+  }
   ProfileDirV3 v3;
   if (!readAt(sizeof(Header) + (uint64_t)i * sizeof(ProfileDirV3), &v3, sizeof(v3))) return false;
   out->width = v3.width;
@@ -205,6 +213,7 @@ bool FbpBook::readProfile(uint32_t i, ProfileDir* out) {
 
 bool FbpBook::selectProfile(uint16_t w, uint16_t h, uint16_t prefer_px) {
   _nGeo = 0;
+  _profSelected = false;
   _oom = false;
   for (uint32_t i = 0; i < _hdr.profile_count && _nGeo < kMaxSizes; i++) {
     ProfileDir d;
@@ -232,6 +241,17 @@ bool FbpBook::selectProfile(uint16_t w, uint16_t h, uint16_t prefer_px) {
       }
     }
   }
+  // Claim the largest matching profile while the opening heap is still clean.
+  // Later size steps reload bytes into these same allocations. If reservation
+  // fails, applyProfile can still open a smaller profile and retain its capacity.
+  uint32_t pageCap = 0, predictorCap = 0;
+  for (int i = 0; i < _nGeo; ++i) {
+    uint32_t page, predictors;
+    if (!profileCapacity(_geo[i], &page, &predictors)) continue;
+    if (page > pageCap) pageCap = page;
+    if (predictors > predictorCap) predictorCap = predictors;
+  }
+  ensureCapacity(pageCap, predictorCap);
   // A profile whose page buffer cannot allocate right now must not refuse
   // the whole book: try the others before giving up.
   bool applied = applyProfile(pick);
@@ -245,52 +265,92 @@ bool FbpBook::selectProfile(uint16_t w, uint16_t h, uint16_t prefer_px) {
   return true;
 }
 
+bool FbpBook::profileCapacity(const ProfileDir& d, uint32_t* page, uint32_t* predictors) {
+  *page = *predictors = 0;
+  if (_hdr.fmt_ver >= 4) {
+    if (!d.max_raw_page || d.max_raw_page > kMaxRawPage || d.dict_size > kDictCap) return false;
+    *page = d.dict_size + d.max_raw_page + 1;
+  }
+  if (d.reserved[6] == FBP_COMPACT_CODEC) {
+    uint8_t h[8]; uint64_t first = 0;
+    const uint64_t at = d.dict_off + d.dict_size;
+    if (at < d.dict_off || !readAt(at, h, 8) || memcmp(h, "PRED", 4) ||
+        !readAt(d.page_index_off, &first, 8)) return false;
+    *predictors = fc_u32(h + 4);
+    if (*predictors > FBP_PREDICTOR_CAP || first != at + 8 + (uint64_t)*predictors * 8) return false;
+  }
+  return true;
+}
+
+bool FbpBook::ensureCapacity(uint32_t page, uint32_t predictors) {
+  // Growth is atomic: a failed reservation leaves the old allocations intact.
+  // Neither allocation grows beyond the validated format caps.
+  if (page > kDictCap + kMaxRawPage + 1 || predictors > FBP_PREDICTOR_CAP) return false;
+  uint8_t* nextPage = nullptr;
+  FcPredictor* nextPredictors = nullptr;
+  if (page > _pageCap) {
+    nextPage = (uint8_t*)malloc(page);
+    if (!nextPage) { _oom = true; return false; }
+  }
+  if (predictors > _predictorCap) {
+    nextPredictors = (FcPredictor*)malloc(predictors * sizeof(FcPredictor));
+    if (!nextPredictors) { free(nextPage); _oom = true; return false; }
+  }
+  if (nextPage) {
+    free(_page); _page = nextPage; _pageCap = page;
+    _wordTail = _wordTextColumn = nullptr;
+  }
+  if (nextPredictors) {
+    free(_predictors); _predictors = nextPredictors; _predictorCap = predictors;
+  }
+  return true;
+}
+
 bool FbpBook::applyProfile(int idx) {
+  _profSelected = false;
+  _wordTail = _wordTextColumn = nullptr;
+  _lineCidCount = 0;
   const ProfileDir& d = _geo[idx];
+  uint32_t pageCap, predictorCount;
+  if (!profileCapacity(d, &pageCap, &predictorCount)) return false;
+  if (!ensureCapacity(pageCap, predictorCount)) {
+    Serial.printf("[xphone-os] fbp: no room for profile buffers (page=%lu predictors=%lu heap=%u)\n",
+                  (unsigned long)pageCap, (unsigned long)(predictorCount * sizeof(FcPredictor)), ESP.getFreeHeap());
+    return false;
+  }
+  if (!d.page_count || d.page_index_off > _f.size() ||
+      (uint64_t)d.page_count * 8 > _f.size() - d.page_index_off ||
+      d.atlas_off != d.page_index_off + (uint64_t)d.page_count * 8) return false;
   uint64_t off = d.atlas_off;
   uint8_t fc = 0;
   if (!readAt(off, &fc, 1)) return false;
   off += 1;
-  _nfonts = fc < kMaxFonts ? fc : kMaxFonts;
+  if (fc > kMaxFonts) return false;
+  _nfonts = fc;
   for (uint8_t fi = 0; fi < _nfonts; fi++) {
     uint32_t cnt = 0, blen = 0;
     if (!readAt(off, &cnt, 4) || !readAt(off + 4, &blen, 4)) return false;
+    if (cnt > 65536 || off + 8 + (uint64_t)cnt * sizeof(GlyphMeta) + blen > _f.size()) return false;
     _fontCount[fi] = cnt;
+    _fontBlobSize[fi] = blen;
     _fontMetaOff[fi] = off + 8;
     _fontBlobOff[fi] = off + 8 + (uint64_t)cnt * sizeof(GlyphMeta);
     off = _fontBlobOff[fi] + blen;
   }
 
-  // v4: claim the page buffer for THIS profile and load its dictionary.
-  // stepSize calls back in here to change size, so the old buffer goes
-  // first — the two profiles have different dictionaries.
-  free(_page);
-  _page = nullptr;
-  _pageCap = 0;
+  // Reload this profile's dictionary/table without releasing reserved capacity.
+  // A caller that rolls back after a read failure must render the old page again.
+  _predictorCount = 0;
   _dictLen = 0;
-  if (_hdr.fmt_ver >= 4) {
-    if (d.max_raw_page == 0 || d.max_raw_page > kMaxRawPage || d.dict_size > kDictCap) {
-      Serial.printf("[xphone-os] fbp: profile %d has a bad page buffer (raw=%lu dict=%lu)\n", idx,
-                    (unsigned long)d.max_raw_page, (unsigned long)d.dict_size);
-      return false;
-    }
-    const uint32_t cap = d.dict_size + d.max_raw_page;
-    _page = (uint8_t*)malloc(cap);
-    if (!_page) {
-      Serial.printf("[xphone-os] fbp: no room for a %lu byte page buffer (heap=%u)\n",
-                    (unsigned long)cap, ESP.getFreeHeap());
-      _oom = true;
-      return false;
-    }
-    if (d.dict_size && !readAt(d.dict_off, _page, d.dict_size)) {
-      free(_page);
-      _page = nullptr;
-      return false;
-    }
-    _pageCap = cap;
-    _dictLen = d.dict_size;
-  }
+  if (d.dict_size && !readAt(d.dict_off, _page, d.dict_size)) return false;
+  _dictLen = d.dict_size;
+  if (predictorCount &&
+      (!readAt(d.dict_off + d.dict_size + 8, _predictors, predictorCount * sizeof(FcPredictor)) ||
+       !fc_table_valid(_predictors, predictorCount))) return false;
+  _predictorCount = predictorCount;
   _profIdx = idx;
+  _profSelected = true;
+  _oom = false;
   return true;
 }
 
@@ -302,7 +362,8 @@ bool FbpBook::applyProfile(int idx) {
 // output, or past it into the dictionary. That is exactly what a preset
 // dictionary means, and it needs no second buffer and no copy per page.
 bool FbpBook::inflatePage(uint64_t rec_off, uint32_t clen, uint32_t raw_len) {
-  if (!_page || raw_len == 0 || _dictLen + raw_len > _pageCap) return false;
+  if (!_page || raw_len == 0 || raw_len > _geo[_profIdx].max_raw_page ||
+      _dictLen + raw_len + 1 > _pageCap) return false;
   if (clen == 0 || clen > kMaxRecordSize) return false;
   uint8_t* comp = (uint8_t*)malloc(clen);
   if (!comp) return false;
@@ -318,11 +379,11 @@ bool FbpBook::inflatePage(uint64_t rec_off, uint32_t clen, uint32_t raw_len) {
   u.source_read_cb = nullptr;
   u.dest_start = _page;
   u.dest = _page + _dictLen;
-  u.dest_limit = u.dest + raw_len;
+  u.dest_limit = u.dest + raw_len + 1;
   const int r = uzlib_uncompress(&u);
-  const bool full = (u.dest == u.dest_limit);
+  const bool full = (u.dest == _page + _dictLen + raw_len) && u.source == u.source_limit;
   free(comp);
-  if ((r != TINF_OK && r != TINF_DONE) || !full) {
+  if (r != TINF_DONE || !full) {
     Serial.printf("[xphone-os] fbp: inflate failed r=%d got=%u want=%lu\n", r,
                   (unsigned)(u.dest - (_page + _dictLen)), (unsigned long)raw_len);
     return false;
@@ -341,6 +402,7 @@ bool FbpBook::hasGeometry(const uint16_t w, const uint16_t h) {
 
 bool FbpBook::selectProfileFresh(const uint16_t w, const uint16_t h) {
   const uint16_t want = _profSelected ? pxSize() : 0;
+  const bool hadProfile = _profSelected;
   const int savedGeo = _nGeo, savedIdx = _profIdx;
   ProfileDir saved[kMaxSizes];
   memcpy(saved, _geo, sizeof(saved));
@@ -349,6 +411,7 @@ bool FbpBook::selectProfileFresh(const uint16_t w, const uint16_t h) {
   memcpy(_geo, saved, sizeof(saved));  // restore on failure
   _nGeo = savedGeo;
   _profIdx = savedIdx;
+  _profSelected = hadProfile && applyProfile(savedIdx);
   return false;
 }
 
@@ -424,7 +487,7 @@ bool FbpBook::pageFirstSentId(const ProfileDir& d, uint16_t page, uint32_t* sid)
 // same-ID pages measures how deep into the paragraph a page is; expanding
 // a run costs a handful of 12-byte reads (runs are short).
 bool FbpBook::stepSize(int dir, uint16_t cur_page, uint16_t* new_page) {
-  if (_nGeo <= 1) return false;
+  if (!_profSelected || _nGeo <= 1) return false;
   const int target = (_profIdx + (dir > 0 ? 1 : _nGeo - 1)) % _nGeo;
   uint32_t cid = 0;
   if (!pageFirstSentId(_geo[_profIdx], cur_page, &cid)) return false;
@@ -441,14 +504,10 @@ bool FbpBook::stepSize(int dir, uint16_t cur_page, uint16_t* new_page) {
   }
   const uint32_t k = cur_page - old_start;
 
+  const int previous = _profIdx;
   if (!applyProfile(target)) {
-    // The target's page buffer would not fit (a small size packs the most
-    // glyphs per page — a 14 px buffer can top 16 KB against a fragmented
-    // reading heap; seen on the bench X4 with a Press book). The failed
-    // attempt already freed OUR buffer, so re-apply the current profile —
-    // its allocation just came back to the heap — and report failure with
-    // the book still readable. Never a blank page.
-    applyProfile(_profIdx);
+    _profSelected = applyProfile(previous);
+    if (!_profSelected) Serial.printf("%s", "[xphone-os] fbp: size rollback failed\n");
     return false;
   }
 
@@ -520,6 +579,31 @@ static int cmpGlyphOffset(const void* a, const void* b) {
   return ga->bits_off > gb->bits_off ? 1 : 0;
 }
 
+#if defined(FLOWE_BENCH_COMPACT)
+bool FbpBook::benchProfile(uint32_t profile, uint16_t* width, uint16_t* height) {
+  if (!_open || !readProfile(profile, &_geo[0])) return false;
+  _nGeo = 1; _profSelected = applyProfile(0);
+  *width = _geo[0].width; *height = _geo[0].height;
+  return _profSelected;
+}
+bool FbpBook::benchBodyCrc(uint16_t page, uint32_t* crc) {
+  if (!_profSelected || page >= pageCount() || _hdr.fmt_ver < 8) return false;
+  const ProfileDir& d = _geo[_profIdx];
+  uint64_t at, end = d.page_index_off; uint8_t head[12];
+  if (!readAt(d.page_index_off + (uint64_t)page * 8, &at, 8) ||
+      (page + 1 < pageCount() && !readAt(d.page_index_off + (uint64_t)(page + 1) * 8, &end, 8)) ||
+      end < at + 12 || end - at > kMaxRecordSize || !readAt(at, head, 12) ||
+      !inflatePage(at + 12, (uint32_t)(end - at - 12), fc_u32(head + 8))) return false;
+  uint32_t h = fc_crc_bytes(UINT32_MAX, head, 8);
+  if (d.reserved[6] == FBP_COMPACT_CODEC) {
+    FcPage v;
+    if (!fc_page(&v, _page + _dictLen, fc_u32(head + 8), _predictors, _predictorCount) ||
+        !fc_body_crc(&v, _predictors, _predictorCount, &h)) return false;
+  } else h = fc_crc_bytes(h, _page + _dictLen, fc_u32(head + 8));
+  *crc = ~h; return true;
+}
+#endif
+
 bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
   if (!_open || !_profSelected || page >= pageCount()) return false;
   const ProfileDir& d = _geo[_profIdx];
@@ -530,6 +614,10 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
   } else {
     next_off = d.page_index_off;  // records precede the index
   }
+  _wordTail = _wordTextColumn = nullptr;
+  _lineCidCount = 0;
+  if (next_off < rec_off || next_off - rec_off > kMaxRecordSize ||
+      next_off > d.page_index_off || (_hdr.fmt_ver >= 4 && rec_off < d.dict_off + d.dict_size)) return false;
   uint32_t rec_size = (uint32_t)(next_off - rec_off);
   if (rec_size < 12 || rec_size > kMaxRecordSize) return false;
 
@@ -557,6 +645,26 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
     }
     body = owned + 8;  // past first_cid + first_sid
     body_end = owned + rec_size;
+  }
+  const bool compact = d.reserved[6] == FBP_COMPACT_CODEC;
+  FcPage columns;
+  FcGlyphCursor cursor;
+  if (body_end - body < 4) { free(owned); return false; }
+  if (compact) {
+    if (!fc_page(&columns, body, (size_t)(body_end - body), _predictors, _predictorCount)) return false;
+    for (uint32_t g = 0; g < columns.glyphs; g++) {
+      const uint8_t f = columns.fonts[g];
+      const uint16_t ix = (uint16_t)(columns.low[g] | ((uint16_t)columns.high[g] << 8));
+      if (f >= _nfonts || ix >= _fontCount[f]) return false;
+    }
+    for (uint16_t im = 0; im < columns.nimages; im++) {
+      const uint32_t ix = fc_u32(columns.tail + (uint32_t)im * 12);
+      ImageDirEnt image;
+      if (ix >= _hdr.image_count || !readAt(_hdr.images_dir_off + (uint64_t)ix * sizeof(image), &image, sizeof(image)) ||
+          image.off > _f.size() || image.size > _f.size() - image.off ||
+          (uint64_t)((image.w + 7) / 8) * image.h > image.size) return false;
+    }
+    body += 6;
   }
   uint16_t nlines, nimgs;
   memcpy(&nlines, body, 2);
@@ -587,23 +695,25 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
   memset(keyset, 0xFF, kHash * sizeof(uint32_t));  // key high bits <= 5: 0xFFFFFFFF is free
   uint32_t nuniq = 0;
   const uint8_t* p = body;
-  const uint8_t* rec_end = body_end;
+  const uint8_t* rec_end = compact ? columns.tail_end : body_end;
+  uint32_t columnGlyph = 0;
   for (uint16_t l = 0; l < nlines && p + 4 <= rec_end; l++) {
     uint16_t count;
     memcpy(&count, p + 2, 2);
     p += 4;
-    for (uint16_t g = 0; g < count && p + 3 <= rec_end; g++) {
-      uint32_t key = ((uint32_t)(p[0] + 1) << 16);
-      uint16_t idx;
-      memcpy(&idx, p + 1, 2);
-      key |= idx;
-      p += 3;
-      if (v4) {
-        skipVarint(&p, rec_end);  // x delta: this scan only needs the glyph id
+    for (uint16_t g = 0; g < count && (compact || p + 3 <= rec_end); g++) {
+      uint32_t key; uint16_t idx;
+      if (compact) {
+        key = (uint32_t)(columns.fonts[columnGlyph] + 1) << 16;
+        idx = (uint16_t)(columns.low[columnGlyph] | ((uint16_t)columns.high[columnGlyph] << 8));
+        columnGlyph++;
       } else {
-        if (p + 2 > rec_end) break;
-        p += 2;
+        key = (uint32_t)(p[0] + 1) << 16;
+        memcpy(&idx, p + 1, 2); p += 3;
+        if (v4) skipVarint(&p, rec_end);
+        else { if (p + 2 > rec_end) break; p += 2; }
       }
+      key |= idx;
       uint32_t h = (key * 2654435761u) & (kHash - 1);
       while (keyset[h] != 0xFFFFFFFFu && keyset[h] != key) h = (h + 1) & (kHash - 1);
       if (keyset[h] == 0xFFFFFFFFu && nuniq < kMaxPageGlyphs) {
@@ -637,7 +747,7 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
   // ascending reads share sectors), recording each glyph's bits size.
   // uniq[] is appended in page order; sort a light index by key (font,idx).
   FbpBook_PageGlyphSort* order =
-      (FbpBook_PageGlyphSort*)malloc(nuniq * sizeof(FbpBook_PageGlyphSort));
+      (FbpBook_PageGlyphSort*)malloc((nuniq ? nuniq : 1) * sizeof(FbpBook_PageGlyphSort));
   if (!order) {
     free(uniq);
     free(owned);
@@ -660,6 +770,9 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
     }
     uint32_t rowbytes = ((uint32_t)g->meta.w + 7) / 8;
     uint32_t need = rowbytes * g->meta.h;
+    if (g->meta.bits_off > _fontBlobSize[font] || need > _fontBlobSize[font] - g->meta.bits_off) {
+      free(order); free(uniq); free(owned); return false;
+    }
     if (need > kMaxGlyphBits) {
       g->meta.h = (uint16_t)(kMaxGlyphBits / (rowbytes ? rowbytes : 1));
       need = rowbytes * g->meta.h;
@@ -681,8 +794,9 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
   // render proper (record + index map + right-sized uniq + sort + arena).
   // HEAP peak only: the key-set and index map are static now (2026-09-02)
   // and no longer count — the number must say what a page can fail to get.
-  const uint32_t scanPeak = rec_size;
-  const uint32_t renderPeak = rec_size + nuniq * (uint32_t)sizeof(PageGlyph) +
+  const uint32_t resident = residentBytes();
+  const uint32_t scanPeak = resident + rec_size;
+  const uint32_t renderPeak = resident + (owned ? rec_size : 0) + nuniq * (uint32_t)sizeof(PageGlyph) +
                               nuniq * (uint32_t)sizeof(FbpBook_PageGlyphSort) + arena_need;
   const uint32_t peak = renderPeak > scanPeak ? renderPeak : scanPeak;
   _lastPeak = peak;
@@ -717,6 +831,7 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
 
   // Pass 4: draw everything from RAM.
   p = body;
+  if (compact) fc_cursor(&cursor, &columns);
   for (uint16_t l = 0; l < nlines && p + 4 <= rec_end; l++) {
     int16_t baseline;
     uint16_t count;
@@ -724,20 +839,20 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
     memcpy(&count, p + 2, 2);
     p += 4;
     if (l < kMaxPageLines) _lineBase[l] = baseline;  // R1: retained for the highlight box
-    int32_t x = 0;  // v4: x accumulates along the line and resets on each one
-    for (uint16_t g = 0; g < count && p + 3 <= rec_end; g++) {
-      uint32_t key = ((uint32_t)(p[0] + 1) << 16);
-      uint16_t idx;
-      memcpy(&idx, p + 1, 2);
-      p += 3;
-      if (v4) {
-        x += readVarint(&p, rec_end);
+    int32_t x = 0;
+    if (compact) fc_line(&cursor);
+    for (uint16_t g = 0; g < count && (compact || p + 3 <= rec_end); g++) {
+      uint32_t key; uint16_t idx;
+      if (compact) {
+        uint8_t font;
+        // fc_page validated this exact cursor before any draw.
+        if (!fc_glyph(&cursor, _predictors, _predictorCount, &font, &idx, &x)) break;
+        key = (uint32_t)(font + 1) << 16;
       } else {
-        if (p + 2 > rec_end) break;
-        int16_t ax;
-        memcpy(&ax, p, 2);
-        x = ax;
-        p += 2;
+        key = (uint32_t)(p[0] + 1) << 16;
+        memcpy(&idx, p + 1, 2); p += 3;
+        if (v4) { int32_t dx = readVarint(&p, rec_end); if (!fc_add(x, dx, &x)) break; }
+        else { if (p + 2 > rec_end) break; int16_t ax; memcpy(&ax, p, 2); x = ax; p += 2; }
       }
       key |= idx;
       uint32_t h = (key * 2654435761u) & (kHash - 1);
@@ -756,6 +871,7 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
       }
     }
   }
+  if (compact) p = columns.tail;
   for (uint16_t im = 0; im < nimgs && p + 12 <= rec_end; im++, p += 12) {
     uint32_t idx;
     int16_t x, y;
@@ -781,13 +897,14 @@ bool FbpBook::renderPage(Gfx& gfx, uint16_t page) {
       uint32_t cid = firstCid;
       uint16_t l = 0;
       for (; l < nlines && p < rec_end && _lineCidCount < kMaxPageLines; l++) {
-        cid = (uint32_t)((int32_t)cid + readVarint(&p, rec_end));
+        cid += (uint32_t)readVarint(&p, rec_end);
         _lineCids[_lineCidCount++] = cid;
       }
       // v8 word tail follows, and only lives on while the body sits in
       // the page buffer (v4+ books; a v3 record buffer is freed below).
       if (_hdr.fmt_ver >= 8 && l == nlines && !owned && p < rec_end) {
         _wordTail = p;
+        _wordTextColumn = compact ? columns.text : nullptr;
         _wordTailEnd = rec_end;
         _wordTailLines = nlines;
         _wordTailPage = page;
@@ -807,6 +924,7 @@ uint16_t FbpBook::pageWords(WordBox* out, uint16_t cap) {
   const uint8_t* p = _wordTail;
   const uint8_t* end = _wordTailEnd;
   const uint8_t* body = _page + _dictLen;
+  const uint8_t* text = _wordTextColumn;
   uint16_t n = 0;
   for (uint16_t l = 0; l < _wordTailLines && p < end; l++) {
     const int32_t count = readVarint(&p, end);
@@ -817,17 +935,17 @@ uint16_t FbpBook::pageWords(WordBox* out, uint16_t cap) {
       if (p + 2 > end) return n;
       const uint8_t flags = *p++;
       const uint8_t tl = *p++;
-      if (p + tl > end) return n;
+      if (!text && p + tl > end) return n;
       if (n < cap && l < kMaxPageLines) {
         out[n].x = (int16_t)x0;
         out[n].w = (int16_t)width;
         out[n].line = (uint8_t)l;
         out[n].flags = flags;
-        out[n].textOff = (uint16_t)(p - body);
+        out[n].textOff = (uint16_t)((text ? text : p) - body);
         out[n].textLen = tl;
         n++;
       }
-      p += tl;
+      if (text) text += tl; else p += tl;
       prev = x0 + width;
     }
   }
@@ -838,6 +956,7 @@ void FbpBook::wordText(const WordBox& w, char* dst, size_t cap) const {
   if (!dst || !cap) return;
   dst[0] = 0;
   if (!_wordTail || !_page) return;
+  if ((uint32_t)w.textOff + w.textLen > _pageCap - _dictLen) return;
   const uint8_t* src = _page + _dictLen + w.textOff;
   size_t take = w.textLen < cap - 1 ? w.textLen : cap - 1;
   memcpy(dst, src, take);
@@ -1000,6 +1119,8 @@ void FbpBook::close() {
   _open = _profSelected = false;
   _nfonts = 0;
   _nGeo = 0;
+  free(_predictors); _predictors = nullptr; _predictorCount = _predictorCap = 0;
+  _wordTextColumn = nullptr;
   free(_page);  // the dictionary + page buffer lives only while a book is open
   _page = nullptr;
   _pageCap = _dictLen = 0;

@@ -1,3 +1,6 @@
+#include "../TransferMemoryProbe.h"
+#include "../BenchFramebufferLoan.h"
+#include "../TransferSync.h"
 #include <Preferences.h>
 #include "FileTransferScene.h"
 #include "../StackProbe.h"
@@ -13,6 +16,7 @@
 #include <lwip/tcp.h>
 #include <lwip/priv/tcp_priv.h>
 #include <esp_system.h>
+
 
 #include <cstdio>
 #include <cstring>
@@ -32,7 +36,7 @@ uint32_t gWifiTestAtMs = 0;
 char gWifiTestSsid[64] = {0};
 
 // net/FileTransferServer.cpp — the W3 session token, RAM only.
-void transferSetSessionToken(const char* token);
+void transferSetSessionToken(const char* token, bool ownedReadiness);
 // main.cpp devcon 'wifibad': the next join uses a wrong password (bench).
 bool gTransferBadPassword = false;
 
@@ -53,10 +57,6 @@ constexpr int kPumpPerTick = 8;
 // The phone's join dialog is a human step; two minutes is generous for it
 // and short enough that a dismissed dialog cannot flatten the battery.
 constexpr uint32_t kApNoClientTimeoutMs = 120000;
-// Sync in place: the hotspot stays behind the pill this long with no client
-// before the QR code has to be seen (Android's join dialog lists a new AP
-// 11-15 s after it comes up; iOS joins by name without a dialog).
-constexpr uint32_t kSilentQrAfterMs = 30000;
 static bool sSilentNow = false;  // the progress hook must not repaint behind the pill
 // Same patience for a LAN session that goes quiet. A phone that dies
 // mid-upload used to strand the device in Wi-Fi mode for ever, holding BLE
@@ -89,13 +89,113 @@ constexpr const char* kHostname = "xphone";
 volatile int gLastStaDisconnectReason = 0;
 }  // namespace
 
+
+namespace {
+bool sSyncDisplay = false;
+bool sHandlingHttp = false;
+bool sCancelSync = false;
+}
+namespace transfer_sync {
+bool active() { return sSyncDisplay; }
+bool memoryReleased() { return sSyncDisplay && G_GFX && !G_GFX->display().getFrameBuffer(); }
+bool handlingHttp() { return sHandlingHttp; }
+void setHandlingHttp(bool active) { sHandlingHttp = active; }
+void requestCancel() { sCancelSync = true; }
+bool cancelRequested() { return sCancelSync; }
+}
+
+bool FileTransferScene::activateSyncMemory(bool associatedHotspot) {
+  if (_state != State::Running || !G_GFX) return false;
+  // An AP client has already used the connection help to join. Prepare RAM
+  // before parsing its first HTTP request. This does not grant session
+  // authority: status and every owned request still check reader and token.
+  // STA keeps its help/fallback until verified contact on that route.
+  if (!_server.verifiedContact() && !(associatedHotspot && _directMode && WiFi.softAPgetStationNum() > 0)) {
+    return false;
+  }
+  // HTTP polling admits only diagnostics/cancel. The outer-tick retry must
+  // not recursively process general USB scene commands from this method.
+  const auto cancelled = [] {
+    return transfer_sync::handlingHttp() ? transfer_sync::pollControls() : transfer_sync::cancelRequested();
+  };
+  const auto routeUsable = [this] {
+    return _directMode ? WiFi.softAPgetStationNum() > 0 : WiFi.status() == WL_CONNECTED;
+  };
+  if (cancelled() || !routeUsable()) return false;
+  if (gWifiTestMode) return true;  // the normal SDK's route test does not need display RAM
+  if (_staticSync) {
+#if defined(FLOWE_SYNC_FAST_SDK)
+    return _framebufferReleased;
+#else
+    return true;  // normal/static-buffer fallback
+#endif
+  }
+  if (SCENES.paused()) return false;
+  // Keep the current picture for phone sync. Manual File Transfer keeps its
+  // connection help. Finish the status bar before releasing display RAM;
+  // the e-ink picture remains on glass without the framebuffer.
+  // Recheck after each flush: cancellation or route loss can arrive while
+  // the panel worker runs. Never release before that worker is idle.
+  SCENES.waitFlushIdle();
+  if (cancelled() || !routeUsable()) return false;
+  if (!_silent) {
+    markDirty();
+    SCENES.renderIfDirty(*G_GFX);
+    SCENES.waitFlushIdle();
+    if (isDirty() || cancelled() || !routeUsable()) return false;
+  }
+  // Refresh even if the text is unchanged: route setup can have changed
+  // the network label since the first bar was drawn.
+  if (!paintPill("Syncing...")) return false;
+  SCENES.waitFlushIdle();
+  if (cancelled() || !routeUsable()) return false;
+  clearDirty();
+  _staticSync = true;
+  SCENES.setPaused(true);
+  _server.progressHook = nullptr;
+  // ReaderScene::onExit discarded its inflate/cache borrow before entry.
+  const unsigned before = ESP.getFreeHeap();
+  _framebufferReleased = G_GFX->releaseFramebufferForSync();
+  sSyncDisplay = true;
+  Serial.printf("[syncmem] static=%d released=%d bytes=%u heap=%u->%u largest=%u tcpWnd=%u tcpSnd=%u\n",
+                _staticSync, _framebufferReleased, static_cast<unsigned>(G_GFX->display().getBufferSize()),
+                before, ESP.getFreeHeap(),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                static_cast<unsigned>(TCP_WND), static_cast<unsigned>(TCP_SND_BUF));
+#if defined(FLOWE_SYNC_FAST_SDK)
+  return _framebufferReleased;
+#else
+  return true;
+#endif
+}
+
+void FileTransferScene::restoreSyncMemory() {
+  // Only used for an in-process exit after server/radio shutdown. Normal
+  // success/cancel uses the existing quiet restart and allocates at boot.
+  if (_framebufferReleased && (!G_GFX || !G_GFX->restoreFramebufferAfterSync())) {
+    const SceneId land = _inPlace ? static_cast<SceneId>(_returnSceneId) : SceneId::Launcher;
+    Serial.println("[syncmem] restore allocation failed; quiet restart");
+    quietRestartToScene(static_cast<uint32_t>(land));
+  }
+  _framebufferReleased = false;
+  _staticSync = false;
+  sSyncDisplay = false;
+  if (G_GFX) G_GFX->setOrientation(Gfx::Orient::Portrait);
+  SCENES.setPaused(false);
+}
+
 void FileTransferScene::onEnter() {
+  _staticSync = false;
+  _framebufferReleased = false;
+  sSyncDisplay = false;
+  sCancelSync = false;
   _state = State::Idle;
   _parkedSinceMs = millis();
   _radioWasUp = false;
   _staEventHandle = 0;
   _directMode = false;
   _targetGiven = false;
+  _hotspotFallback = false;
   _targetSsid[0] = '\0';
   _targetPass[0] = '\0';
   _targetSessionCreds = false;
@@ -121,23 +221,15 @@ void FileTransferScene::beginSilent(const uint32_t returnSceneId) {
   paintPill("Syncing...");
 }
 
-void FileTransferScene::leaveSilent(const char* why) {
-  if (!_silent) return;
-  Serial.printf("[xphone-os] transfer: showing the page (%s)\n", why);
-  _silent = false;
-  sSilentNow = false;
-  markDirty();
-}
-
 // The sync bar (Andrew, 2026-09-07): while a sync runs in place, the
-// bottom soft-key band is painted black with white text, replacing the
-// button labels. That says two things at once: a sync is running, and the
-// buttons do nothing until it ends. The picture above the band stays. In
+// bottom soft-key band is painted black with white text. The picture above
+// it stays for the whole session. Physical BACK can cancel. In
 // landscape the reader's soft-key column on the right takes the same
 // treatment with the word stacked one letter per line. Flushed as a
 // full-frame differential FAST refresh: only the band's pixels move.
-void FileTransferScene::paintPill(const char* text) {
-  if (!G_GFX || SCENES.flushInFlight()) return;  // try again next tick
+bool FileTransferScene::paintPill(const char* text) {
+  if (_staticSync || !G_GFX || !G_GFX->display().getFrameBuffer() ||
+      SCENES.flushInFlight()) return false;  // try again next tick
   Gfx& gfx = *G_GFX;
   const int w = gfx.width();
   const int h = gfx.height();
@@ -173,9 +265,11 @@ void FileTransferScene::paintPill(const char* text) {
   }
   gfx.flush(EInkDisplay::FAST_REFRESH);
   snprintf(_pillShown, sizeof(_pillShown), "%s", text);
+  return true;
 }
 
 void FileTransferScene::silentTick() {
+  if (_staticSync) return;  // the bar is on glass; networking owns its RAM
   if (isDirty()) clearDirty();  // never compose the page behind the pill
   const uint32_t now = millis();
   switch (_state) {
@@ -190,17 +284,13 @@ void FileTransferScene::silentTick() {
       }
       return;
     case State::Failed:
-      leaveSilent("failed");
+      if (strcmp(_pillShown, "Sync failed") != 0) paintPill("Sync failed");
       return;
     case State::Connecting:
       if (strcmp(_pillShown, "Syncing...") != 0) paintPill("Syncing...");
       return;
     case State::Running:
       if (_directMode && WiFi.softAPgetStationNum() == 0) {
-        if (now - _apStartedMs > kSilentQrAfterMs) {
-          leaveSilent("hotspot, nobody joined: the code must be seen");
-          return;
-        }
         if (strcmp(_pillShown, "Waiting for your phone...") != 0) paintPill("Waiting for your phone...");
         return;
       }
@@ -210,21 +300,13 @@ void FileTransferScene::silentTick() {
 }
 
 void FileTransferScene::onExit() {
+  // OS long BACK can bypass exitScene. Keep the saved return destination
+  // and use the same server/radio shutdown before a quiet restart.
+  if (_radioWasUp) endSession("scene exit");
+  restoreSyncMemory();
   _silent = false;
   _inPlace = false;
   sSilentNow = false;
-  // Normal exits go through endSession(), which clears _radioWasUp before
-  // switching scenes. This covers the OS-wide long-press-BACK -> launcher
-  // jump in SceneManager::loop, which bypasses the scene: if the radio is
-  // still up here, tear it down in place and bring BLE back.
-  if (_radioWasUp) {
-    Serial.println("[xphone-os] transfer: leaving with the radio up (launcher jump)");
-    _server.stop();
-    MDNS.end();
-    teardownRadio();
-    transferSetSessionToken("");
-    COMPANION_BLE.resumeAfterTransfer("stopped", "launcher");
-  }
   _state = State::Idle;
 }
 
@@ -236,6 +318,7 @@ const char* const* FileTransferScene::softKeys() const {
   static constexpr const char* kHotspotKeys[4] = {"EXIT", "PASSWORD", nullptr, nullptr};
   static constexpr const char* kHotspotKeysShown[4] = {"EXIT", "CODE", nullptr, nullptr};
   static constexpr const char* kFailedKeys[4] = {"BACK", "RETRY", nullptr, nullptr};
+  if (_staticSync) return kConnectingKeys;
   switch (_state) {
     case State::Idle:       return _ssid[0] ? kIdleKeys : kIdleNoCredsKeys;
     case State::Connecting: return kConnectingKeys;
@@ -251,7 +334,8 @@ void FileTransferScene::autoStart() {
   // the hotspot at once. A phone-hotspot session arrives with its own
   // password. No "ssid" at all (older apps, the bench `sta`) -> the old
   // walk over every saved network.
-  _targetGiven = COMPANION_BLE.takeTransferTarget(_targetSsid, sizeof(_targetSsid), _targetPass, sizeof(_targetPass));
+  _targetGiven = COMPANION_BLE.takeTransferTarget(_targetSsid, sizeof(_targetSsid), _targetPass, sizeof(_targetPass),
+                                                  &_hotspotFallback);
   _targetSessionCreds = _targetGiven && _targetPass[0] != '\0';  // decided BEFORE the store lookup below fills the field
   if (_targetGiven) {
     if (_targetPass[0] == '\0') {
@@ -328,6 +412,7 @@ void FileTransferScene::startAp() {
   Serial.printf("[xphone-os] transfer: direct mode, raising \"%s\" (heap %u)\n", apSsid,
                 ESP.getFreeHeap());
   stackProbe("transfer: before AP");
+  transferMemoryProbe("transfer: before AP");
   COMPANION_BLE.sendTransferStatus("connecting", nullptr, apSsid);
   delay(600);  // one low-duty conn interval so the notify actually transmits
   COMPANION_BLE.shutdownForTransfer();
@@ -347,7 +432,15 @@ void FileTransferScene::raiseHotspot() {
   _showApPassword = false;
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
-  if (!WiFi.softAP(apSsid, apPass, /*channel=*/1, /*ssid_hidden=*/0, /*max_connection=*/4)) {
+#if defined(FLOWE_BENCH_AP_CHANNEL)
+#if FLOWE_BENCH_AP_CHANNEL < 1 || FLOWE_BENCH_AP_CHANNEL > 11
+#error "FLOWE_BENCH_AP_CHANNEL must be in 1..11"
+#endif
+  constexpr int apChannel = FLOWE_BENCH_AP_CHANNEL;
+#else
+  constexpr int apChannel = 1;
+#endif
+  if (!WiFi.softAP(apSsid, apPass, apChannel, /*ssid_hidden=*/0, /*max_connection=*/4)) {
     Serial.println("[xphone-os] transfer: softAP failed");
     _failReason = "Hotspot failed to start";
     _state = State::Failed;
@@ -355,6 +448,10 @@ void FileTransferScene::raiseHotspot() {
     markDirty();
     return;
   }
+#if defined(FLOWE_BENCH_AP_HT20)
+  const esp_err_t bandwidthSet = esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+  Serial.printf("[apbench] HT20 set rc=%d\n", static_cast<int>(bandwidthSet));
+#endif
   // Off the ESP default 192.168.4.x: home LANs use it too (Andrew's does),
   // so a phone-side request to the AP address could reach a ROUTER instead
   // of us. Config after softAP() — before, some cores overwrite it.
@@ -366,8 +463,18 @@ void FileTransferScene::raiseHotspot() {
   snprintf(_ssid, sizeof(_ssid), "%s", apSsid);  // the panel names the hotspot
   snprintf(_ip, sizeof(_ip), "%s", WiFi.softAPIP().toString().c_str());
   Serial.printf("[xphone-os] transfer: hotspot up, ip %s heap %u\n", _ip, ESP.getFreeHeap());
+#if defined(FLOWE_BENCH_AP_CHANNEL) || defined(FLOWE_BENCH_AP_HT20)
+  uint8_t actualChannel = 0;
+  wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+  wifi_bandwidth_t bandwidth = WIFI_BW_HT20;
+  const esp_err_t channelGet = esp_wifi_get_channel(&actualChannel, &secondary);
+  const esp_err_t bandwidthGet = esp_wifi_get_bandwidth(WIFI_IF_AP, &bandwidth);
+  Serial.printf("[apbench] requestedChannel=%d actualChannel=%u secondary=%d channelRc=%d bandwidth=%d bandwidthRc=%d\n",
+                apChannel, static_cast<unsigned>(actualChannel), static_cast<int>(secondary),
+                static_cast<int>(channelGet), static_cast<int>(bandwidth), static_cast<int>(bandwidthGet));
+#endif
   _apStartedMs = millis();
-  _apClientSeenMs = 0;
+  _apClientLeftMs = 0;
   _state = State::Running;
   startServerOrFail();
 }
@@ -385,6 +492,7 @@ void FileTransferScene::finishTest(const char* sentence) {
 }
 
 void FileTransferScene::switchToHotspot(const char* why) {
+  if (_staticSync) { endSession(why); return; }
   Serial.printf("[xphone-os] transfer: %s -> becoming the hotspot (heap %u)\n", why, ESP.getFreeHeap());
   _server.stop();
   MDNS.end();
@@ -413,7 +521,7 @@ void FileTransferScene::endSession(const char* reason, const bool queueStopped, 
   MDNS.end();
   const bool radioWasUp = _radioWasUp;
   if (radioWasUp) teardownRadio();
-  transferSetSessionToken("");  // a restart used to clear it; now by hand
+  transferSetSessionToken("", true);  // a restart used to clear it; now by hand
   // Andrew, 2026-09-07: a sync ends with a quiet restart (3 s, no splash)
   // that lands back on the screen the sync interrupted, the reader at its
   // saved page. The in-place exit stays for the failure path that must
@@ -432,17 +540,18 @@ void FileTransferScene::endSession(const char* reason, const bool queueStopped, 
     sSilentNow = false;
     quietRestartToScene(static_cast<uint32_t>(land));  // does not return
   }
+  restoreSyncMemory();
   _state = State::Idle;
   _failedAtMs = 0;
   if (radioWasUp) {
     COMPANION_BLE.resumeAfterTransfer(queueStopped ? "stopped" : nullptr, reason);
     stackProbe("transfer: after BLE resume");
+  transferMemoryProbe("transfer: after BLE resume");
   } else {
     // BLE never went down (parked screens): say it now.
     COMPANION_BLE.sendTransferStatus("stopped", nullptr, reason);
   }
-  // Back where the sync found us, also after the page had to be shown
-  // (the QR code, a failure): leaveSilent() ends the pill, not the trip.
+  // Return to the screen that the phone's sync interrupted.
   const bool goBack = _inPlace;
   const SceneId back = static_cast<SceneId>(_returnSceneId);
   _silent = false;
@@ -462,9 +571,21 @@ void FileTransferScene::endSession(const char* reason, const bool queueStopped, 
 // lwIP thread where the lists may be touched.
 static void purgeTimeWaitPcbs() {
   const uint32_t heapBefore = ESP.getFreeHeap();
+#if defined(FLOWE_TRANSFER_MEMORY_PROBE)
+  struct PurgeResult { unsigned count = 0; uint32_t before = 0, after = 0; } result;
+  const err_t rc = tcpip_callback_wait([](void* context) {
+    auto& r = *static_cast<PurgeResult*>(context);
+    r.before = ESP.getFreeHeap();
+    while (tcp_tw_pcbs) { ++r.count; tcp_abort(tcp_tw_pcbs); }
+    r.after = ESP.getFreeHeap();
+  }, &result);
+  Serial.printf("[netmem-purge] rc=%d count=%u before=%lu after=%lu\n", rc, result.count,
+                (unsigned long)result.before, (unsigned long)result.after);
+#else
   tcpip_callback([](void*) {
     while (tcp_tw_pcbs) tcp_abort(tcp_tw_pcbs);
   }, nullptr);
+#endif
   delay(30);  // let the callback run before WIFI_OFF tears the stack down
   Serial.printf("[xphone-os] transfer: TIME_WAIT purge heap %u -> %u\n", heapBefore, ESP.getFreeHeap());
 }
@@ -523,8 +644,10 @@ void FileTransferScene::startSta() {
   // after six seconds, so this delay is belt to that braces.
   delay(1200);
   stackProbe("transfer: before BLE shutdown");
+  transferMemoryProbe("transfer: before BLE shutdown");
   COMPANION_BLE.shutdownForTransfer();
   stackProbe("transfer: after BLE shutdown");
+  transferMemoryProbe("transfer: after BLE shutdown");
   // If ReaderScene left a 32 KB inflate dict parked, esp_wifi needs that
   // heap back. Usually a no-op (the dict lives only while Reader is up).
   InflateReader::releaseSharedDict();
@@ -545,6 +668,7 @@ void FileTransferScene::startSta() {
       ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.mode(WIFI_STA);
   stackProbe("transfer: after WiFi.mode(STA)");
+  transferMemoryProbe("transfer: after WiFi.mode(STA)");
   Serial.printf("[xphone-os] transfer: after WiFi.mode(STA) heap=%u largest=%u\n", ESP.getFreeHeap(), static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
   if (gWifiTxPowerQuarterDb > 0) {
     // Bench lever (devcon txpwr): a phone lying on the device is a -28 dBm
@@ -606,6 +730,7 @@ void FileTransferScene::startSta() {
   }
   Serial.printf("[xphone-os] transfer: scan saw %d networks\n", found);
   stackProbe("transfer: after scan");
+  transferMemoryProbe("transfer: after scan");
 
   if (_targetGiven) {
     // Only the network the phone is on. Visible -> join it. Not visible ->
@@ -754,6 +879,13 @@ void FileTransferScene::tryNextCandidate() {
       switchToHotspot("join failed");
       return;
     }
+    if (_hotspotFallback) {
+      // No target because the phone's OS withheld the name, and the saved
+      // list did not get us anywhere. The phone is waiting and WILL follow
+      // us onto the hotspot, so rescue the sync instead of failing it.
+      switchToHotspot("no target, saved networks exhausted");
+      return;
+    }
     WiFi.disconnect(true);
     _failReason = "Could not join Wi-Fi";
     _state = State::Failed;
@@ -798,6 +930,7 @@ void FileTransferScene::pollConnecting() {
     snprintf(_ip, sizeof(_ip), "%s", WiFi.localIP().toString().c_str());
     Serial.printf("[xphone-os] transfer: connected, ip %s\n", _ip);
     stackProbe("transfer: connected");
+  transferMemoryProbe("transfer: connected");
     WifiCreds::markJoined(_ssid);
     _state = State::Running;
     startServerOrFail();
@@ -815,6 +948,27 @@ void FileTransferScene::pollConnecting() {
 }
 
 void FileTransferScene::startServerOrFail() {
+#if defined(FLOWE_SYNC_FAST_SDK)
+  // This local build has measurements only on X4. It must not silently
+  // apply the larger global TCP defaults to an unverified X3 session.
+  static_assert(FREEINK_FB_RELEASABLE, "Fast sync needs releasable display RAM");
+  static_assert(TCP_WND == 17232 && TCP_SND_BUF == 17232, "Unexpected fast SDK windows");
+  if (BoardConfig::ACTIVE.board != BoardConfig::Board::XteinkX4) {
+    _failReason = "Use standard firmware for this reader";
+    _state = State::Failed;
+    _failedAtMs = millis();
+    markDirty();
+    return;
+  }
+#endif
+#if defined(FLOWE_BENCH_AP_NO_MDNS)
+  // Memory experiment: Android's direct-join path probes numeric AP addresses.
+  // Keep shared-network discovery. Verify app retry and guest flows before
+  // considering this as a normal behavior change.
+  if (_directMode) {
+    Serial.println("[memprobe] AP mDNS skipped by bench flag");
+  } else
+#endif
   if (MDNS.begin(kHostname)) {
     Serial.printf("[xphone-os] transfer: mDNS http://%s.local/\n", kHostname);
   }
@@ -822,11 +976,16 @@ void FileTransferScene::startServerOrFail() {
   // body arrives inside one handleClient() call, so without this hook the
   // panel sits on stale numbers until the file ends. (2026-08-18)
   _server.progressHook = [] {
-    if (sSilentNow) return;  // the pill does not change per chunk
+    if (sSilentNow || transfer_sync::active()) return;  // the pill does not change per chunk
     if (SCENES.active()) SCENES.active()->markDirty();
     SCENES.renderNow();
   };
+  _server.prepareStatusContext = this;
+  _server.prepareStatusHook = [](void* context) {
+    return static_cast<FileTransferScene*>(context)->activateSyncMemory();
+  };
   stackProbe("transfer: before server begin");
+  transferMemoryProbe("transfer: before server begin");
   if (!_server.begin()) {
     _failReason = "Server failed to start";
     _state = State::Failed;
@@ -853,6 +1012,7 @@ void FileTransferScene::exitScene() {
 }
 
 void FileTransferScene::handleInput(Input& in) {
+  if (transfer_sync::cancelRequested()) { endSession("cancelled"); return; }
   if (_silent) {
     silentTick();
     if (!_silent && SCENES.active() != this) return;  // silentTick switched scenes
@@ -874,7 +1034,7 @@ void FileTransferScene::handleInput(Input& in) {
       break;
 
     case State::Connecting:
-      if (in.wasPressed(Btn::Back) && !_silent) {  // in place: the bar says the buttons wait
+      if (in.wasPressed(Btn::Back)) {
         // BLE is down while joining; an Idle screen with no radio would be
         // unreachable from the phone. End the session properly instead.
         endSession("cancelled");
@@ -884,16 +1044,29 @@ void FileTransferScene::handleInput(Input& in) {
       break;
 
     case State::Running: {
-      if (in.wasPressed(Btn::Back) && !_silent) {  // in place: the bar says the buttons wait
+      if (in.wasPressed(Btn::Back)) {
         exitScene();
         return;
       }
       for (int i = 0; i < kPumpPerTick; i++) {
+        if (_directMode && !_staticSync) activateSyncMemory(/*associatedHotspot=*/true);
+        if (transfer_sync::cancelRequested()) break;
         _server.handleClient();
+        if (transfer_sync::cancelRequested()) break;
+        if (!_server.stopRequested() && !_server.ownerTransferAborted()) activateSyncMemory();
         stackProbe(_server.lastUri());  // names the request that went deepest
+        if (_server.stopRequested() || (!_directMode && _server.ownerTransferAborted())) break;
       }
+      if (transfer_sync::cancelRequested()) { endSession("cancelled"); return; }
       if (_server.stopRequested()) {
         endSession("phone (http)");
+        return;
+      }
+      if (!_directMode && _server.ownerTransferAborted()) {
+        // The phone may now be on another network and cannot send /stop.
+        // Restore BLE through the normal exit so it can request a new route.
+        // Direct sessions stay up for the phone's paired-hotspot retry.
+        endSession("STA transfer interrupted");
         return;
       }
       if (_directMode && !_silent && in.wasPressed(Btn::Confirm)) {
@@ -929,7 +1102,7 @@ void FileTransferScene::handleInput(Input& in) {
           return;
         }
       }
-      if (!_directMode && _targetGiven && _server.requestCount() == 0 &&
+      if (!_directMode && (_targetGiven || _hotspotFallback) && !_server.verifiedContact() &&
           millis() - _servedSinceMs > kKnockTimeoutMs) {
         switchToHotspot("no knock in 20 s");
         return;
@@ -947,23 +1120,30 @@ void FileTransferScene::handleInput(Input& in) {
           const int clients = WiFi.softAPgetStationNum();
           if (clients != _shownApClients) {
             Serial.printf("[xphone-os] transfer: hotspot clients %d\n", clients);
+            // Give a disconnected phone the full grace period, even after
+            // a long session. Measuring from JOIN ended those sessions
+            // immediately when the phone briefly left the hotspot.
+            if (clients == 0 && _shownApClients > 0) _apClientLeftMs = now;
+            if (clients > 0) _apClientLeftMs = 0;
             _shownApClients = clients;
-            if (clients > 0) _apClientSeenMs = now;
             markDirty();
           }
+          // The two-second poll can miss a brief join after RAM release.
+          // In that case, start the reconnect grace at the observed loss.
+          if (clients == 0 && _staticSync && _apClientLeftMs == 0) _apClientLeftMs = now;
           // Nobody ever joined (the user dismissed the phone's join dialog)
           // or everybody left mid-session: BLE is down, so the phone cannot
           // tell us to stop and auto-sleep is pinned. Come home by
           // ourselves rather than hold the radio up until the battery dies.
           // (Release audit, 2026-08-18.)
-          if (clients == 0 && _apClientSeenMs == 0 &&
+          if (clients == 0 && _apClientLeftMs == 0 &&
               now - _apStartedMs > kApNoClientTimeoutMs) {
             Serial.println("[xphone-os] transfer: hotspot had no client; ending the session");
             endSession("no client");
             return;
           }
-          if (clients == 0 && _apClientSeenMs != 0 &&
-              now - _apClientSeenMs > kApNoClientTimeoutMs) {
+          if (clients == 0 && _apClientLeftMs != 0 &&
+              now - _apClientLeftMs > kApNoClientTimeoutMs) {
             Serial.println("[xphone-os] transfer: hotspot client left; ending the session");
             endSession("client left");
             return;
@@ -985,6 +1165,7 @@ void FileTransferScene::handleInput(Input& in) {
             }
           }
         } else if (WiFi.status() != WL_CONNECTED) {
+          if (_staticSync) { endSession("Wi-Fi lost"); return; }
           Serial.println("[xphone-os] transfer: Wi-Fi dropped; waiting for auto-reconnect");
         } else {
           // STA idle guard. Any HTTP request counts as life. Bytes count

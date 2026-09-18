@@ -18,6 +18,15 @@
 
 #include "../src/bus/EpdBus.h"
 
+// Opt in only for the single-buffer internal-RAM Xteink firmware. Other
+// consumers keep their existing static/PSRAM allocation policy.
+#ifndef FREEINK_FB_RELEASABLE
+#define FREEINK_FB_RELEASABLE 0
+#endif
+#if FREEINK_FB_RELEASABLE && (FREEINK_FB_PSRAM || !defined(EINK_DISPLAY_SINGLE_BUFFER_MODE))
+#error "Releasable framebuffer requires single-buffer internal RAM"
+#endif
+
 namespace freeink {
 
 class PanelDriver;
@@ -26,6 +35,10 @@ class FreeInkDisplay {
  public:
   FreeInkDisplay(int8_t sclk, int8_t mosi, int8_t cs, int8_t dc, int8_t rst, int8_t busy);
   ~FreeInkDisplay() = default;
+#if FREEINK_FB_RELEASABLE
+  FreeInkDisplay(const FreeInkDisplay&) = delete;
+  FreeInkDisplay& operator=(const FreeInkDisplay&) = delete;
+#endif
 
   // Refresh modes (public contract — full / balanced-half / fast).
   enum RefreshMode { FULL_REFRESH, HALF_REFRESH, FAST_REFRESH };
@@ -62,6 +75,12 @@ class FreeInkDisplay {
   uint16_t getDisplayHeight() const { return displayHeight; }
   uint16_t getDisplayWidthBytes() const { return displayWidthBytes; }
   uint32_t getBufferSize() const { return bufferSize; }
+
+  // Main-task ownership boundary. Caller must stop all framebuffer users
+  // and wait for the last panel flush before release. Restoration allocates
+  // a white frame; the caller must compose a complete screen before flush.
+  bool releaseFramebufferForSync();
+  bool restoreFramebufferAfterSync();
 
   // Frame buffer operations
   void clearScreen(uint8_t color = 0xFF) const;
@@ -148,10 +167,13 @@ class FreeInkDisplay {
   // Frame buffer (facade-owned). Static DRAM by default; PSRAM heap on devices
   // with tight DRAM but PSRAM (see FREEINK_FB_PSRAM in BoardConfig.h), allocated
   // in begin().
-#if FREEINK_FB_PSRAM
+#if FREEINK_FB_PSRAM || FREEINK_FB_RELEASABLE
   uint8_t* frameBuffer0 = nullptr;
 #else
   uint8_t frameBuffer0[MAX_BUFFER_SIZE];
+#endif
+#if FREEINK_FB_RELEASABLE
+  uint32_t frameBufferAllocatedSize = 0;
 #endif
   uint8_t* frameBuffer;
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE

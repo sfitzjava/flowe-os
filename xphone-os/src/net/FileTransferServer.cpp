@@ -1,7 +1,22 @@
+#include "../TransferSync.h"
+#include "ControlledWrite.h"
+#include "DownloadRange.h"
+#include "TransferSha256.h"
+#include "StatusAuthorization.h"
+#include "UploadPublication.h"
 #include <Arduino.h>
 #include "FileTransferServer.h"
+#include "HttpResponseBatch.h"
+#include "WifiCreds.h"
+#if defined(FLOWE_RAW_UPLOAD)
+#include "ResumeUploadSd.h"
+#endif
 
 #include "../StallWatch.h"
+#include "../DeviceKind.h"
+#if defined(FLOWE_BENCH_TRANSFER_FLUSH_BARRIER)
+#include "../Scene.h"
+#endif
 
 #include <MD5Builder.h>
 
@@ -10,8 +25,18 @@
 #include <SDCardManager.h>
 #include <WiFi.h>
 #include <esp_heap_caps.h>
+#include "../TransferMemoryProbe.h"
 #include <esp_system.h>
 #include <esp_task_wdt.h>
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+#include <esp_timer.h>
+#endif
+extern "C" {
+#include <lwip/api.h>
+#include <lwip/priv/sockets_priv.h>
+#include <lwip/tcp.h>
+#include <lwip/tcpip.h>
+}
 
 #include <cstring>
 #include <functional>
@@ -21,6 +46,9 @@
 #include "../reader/ReadingStats.h"
 #include "../reader/FbpBook.h"
 #include "../scenes/AppScenes.h"  // XPHONE_VERSION
+#if defined(FLOWE_RAW_UPLOAD)
+static bool finishResumeBook(const char* path);
+#endif
 
 // W3 session token (wifi-experience plan P4): minted by the phone over
 // encrypted BLE before each session, required on mutating endpoints.
@@ -28,7 +56,11 @@
 // the accepted risk, deletes are not. RAM only; a restart clears it.
 static char gSessionToken[48] = {0};
 
-void transferSetSessionToken(const char* token) {
+// Only the encrypted BLE token exchange selects legacy readiness. HTTP
+// headers cannot downgrade a strict session. Clearing a token clears mode.
+static bool gOwnedReadiness = true;
+void transferSetSessionToken(const char* token, bool ownedReadiness) {
+  gOwnedReadiness = !token || !token[0] || ownedReadiness;
   snprintf(gSessionToken, sizeof(gSessionToken), "%s", token ? token : "");
   Serial.printf("[xphone-os] transfer: session token set (len=%u)\n",
                 (unsigned)strlen(gSessionToken));
@@ -38,6 +70,89 @@ namespace {
 // Single upload at a time (one phone, one request in flight); keeping the
 // FsFile at file scope spares every includer the SdFat headers.
 FsFile gUploadFile;
+
+#if defined(FLOWE_RAW_UPLOAD)
+// The pinned RequestHandler API selects raw parsing without using the
+// multipart FunctionRequestHandler's upload callback on a raw body.
+class RawUploadHandler final : public RequestHandler {
+ public:
+  using RawCallback = std::function<void(HTTPRaw&)>;
+  RawUploadHandler(RawCallback raw, WebServer::THandlerFunction done)
+      : _raw(raw), _done(done) {}
+  bool canHandle(WebServer&, HTTPMethod method, const String& uri) override {
+    return method == HTTP_POST && uri == "/upload/raw";
+  }
+  bool canRaw(WebServer& server, const String& uri) override {
+    return canHandle(server, server.method(), uri);
+  }
+  bool handle(WebServer& server, HTTPMethod method, const String& uri) override {
+    if (!canHandle(server, method, uri)) return false;
+    _done();
+    return true;
+  }
+  void raw(WebServer&, const String&, HTTPRaw& body) override { _raw(body); }
+ private:
+  RawCallback _raw;
+  WebServer::THandlerFunction _done;
+};
+#endif
+
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+// Fixed counters and timestamps only: no allocation or per-callback output.
+struct UploadDuration {
+  uint64_t& total;
+  uint64_t* const also;
+  const int64_t started = esp_timer_get_time();
+  explicit UploadDuration(uint64_t& destination, uint64_t* secondary = nullptr)
+      : total(destination), also(secondary) {}
+  ~UploadDuration() {
+    const uint64_t elapsed = static_cast<uint64_t>(esp_timer_get_time() - started);
+    total += elapsed;
+    if (also) *also += elapsed;
+  }
+};
+#endif
+
+#if defined(FLOWE_BENCH_TRANSFER_FLUSH_BARRIER)
+void waitTransferDisplay(const char* phase) {
+  const uint32_t started = millis();
+  SCENES.waitFlushIdle();
+  const uint32_t waited = millis() - started;
+  if (waited) {
+    Serial.printf("[transfer-barrier] phase=%s waitedMs=%lu\n", phase,
+                  static_cast<unsigned long>(waited));
+  }
+}
+#endif
+
+// A failed response cannot be resumed on this HTTP connection. Graceful
+// close can retain its unsent data for TCP retries, starving the next request.
+// SO_LINGER is disabled in our SDK. Use its socket lookup to abort only this
+// client's PCB under the TCP/IP lock, then let NetworkClient release the
+// socket/netconn normally. tcp_abort's error callback clears conn->pcb.tcp.
+// Call synchronously from the single-client server while it still owns fd;
+// never save the descriptor across stop() (the OS could reuse it).
+void abortFailedDownload(NetworkClient& client) {
+  struct Abort { int fd; bool aborted; } state{client.fd(), false};
+  if (state.fd >= 0) {
+    const err_t rc = tcpip_callback_wait([](void* context) {
+      auto& s = *static_cast<Abort*>(context);
+      auto* socket = lwip_socket_dbg_get_socket(s.fd);
+      auto* conn = socket ? socket->conn : nullptr;
+      if (conn && NETCONNTYPE_GROUP(conn->type) == NETCONN_TCP &&
+          conn->state == NETCONN_NONE && conn->pcb.tcp && conn->pcb.tcp->state != LISTEN) {
+        tcp_abort(conn->pcb.tcp);
+        s.aborted = true;
+      }
+    }, &state);
+    Serial.printf("[xphone-os] transfer: failed download close fd=%d aborted=%u rc=%d\n",
+                  state.fd, state.aborted, rc);
+  }
+  client.stop();
+#if defined(FLOWE_TRANSFER_MEMORY_PROBE)
+  transferNetworkMemoryProbe("download-aborted");
+#endif
+}
 
 bool hasEpubExtension(const char* name) {
   const size_t len = strlen(name);
@@ -82,7 +197,46 @@ bool isSafePath(const char* path) {
   }
   return true;
 }
+// One synchronous upload means one journal is enough. Both names are in a
+// hidden namespace which neither legacy nor raw uploads can create.
+constexpr const char* kUploadBackup = "/.flowe-upload-backup";
+constexpr const char* kUploadJournal = "/.flowe-upload-target";
+bool recoverUploadPublication() {
+  if (!SdMan.exists(kUploadBackup)) {
+    if (SdMan.exists(kUploadJournal)) return SdMan.remove(kUploadJournal);
+    return true;
+  }
+  FsFile journal = SdMan.open(kUploadJournal, O_RDONLY);
+  char target[192] = {};
+  if (!journal || journal.size() == 0 || journal.size() >= sizeof(target)) return false;
+  const size_t size = journal.size();
+  const int got = journal.read(target, size);
+  const bool closed = journal.close();
+  if (!closed || got != int(size) || strlen(target) != size || !isSafePath(target)) return false;
+  if (!flowe_upload::recover(SdMan, target, kUploadBackup)) return false;
+  return SdMan.remove(kUploadJournal);
+}
+bool publishUpload(const char* part, const char* target) {
+  if (!recoverUploadPublication()) return false;
+  // Persist the target BEFORE moving the old bytes. A partial journal can
+  // never accompany our only old copy. Close checks include SdFat sync.
+  FsFile journal = SdMan.open(kUploadJournal, O_WRONLY | O_CREAT | O_TRUNC);
+  if (!journal) return false;
+  const size_t size = strlen(target);
+  const bool written = journal.write(reinterpret_cast<const uint8_t*>(target), size) == size;
+  const bool closed = journal.close();
+  if (!written || !closed) return false;
+  const bool published = flowe_upload::publish(SdMan, part, target, kUploadBackup);
+  if (!SdMan.exists(kUploadBackup)) SdMan.remove(kUploadJournal);
+  return published;
+}
+#if defined(FLOWE_RAW_UPLOAD)
+flowe_resume::SdStorage gResumeStorage;
+flowe_resume::Upload<flowe_resume::SdStorage, flowe_resume::Sha256> gResumeUpload(gResumeStorage);
+#endif
 }  // namespace
+
+bool FileTransferServer::recoverUploads() { return recoverUploadPublication(); }
 
 // True when no token is set (legacy phone) or the request carries it.
 bool FileTransferServer::tokenOk() {
@@ -91,16 +245,62 @@ bool FileTransferServer::tokenOk() {
   return _server->header("X-Flowe-Token") == gSessionToken;
 }
 
+// A phone can change networks after discovery, where the same IP may name
+// another reader. This target check is independent of session authority.
+// No target keeps the guest page and older phone clients compatible.
+bool FileTransferServer::targetReaderOk() {
+  // WebServer takes String keys; retain the 17-byte key instead of building
+  // two heap-backed temporary Strings for every upload chunk.
+  static const String headerName("X-Flowe-Reader-Id");
+  if (headerName.length() != sizeof("X-Flowe-Reader-Id") - 1) return false;
+  const String target = _server->header(headerName);
+  // Match WebServer::hasHeader: missing and present-empty both mean absent.
+  if (target.length() == 0) return true;
+  // This device ID does not change during this boot. Cache only our ID, never
+  // the request's supplied target or its authorization result. Retry failure.
+  static char readerId[WifiCreds::kReaderIdSize] = {0};
+  if (!readerId[0] && !WifiCreds::readerId(readerId, sizeof(readerId))) return false;
+  return target == readerId;
+}
+
 bool FileTransferServer::begin() {
+  _verifiedContact = false;
+  _upload.bufferCapacity = UploadState::kBufferSize;
+  _upload.bufferGrowthTried = false;
+  transferMemoryStart();
+  // SPI and sockets copy this scratch buffer; it does not need DMA. Prefer
+  // RTC fast RAM so this session-long reservation leaves DRAM for Wi-Fi's
+  // DMA buffers. Fall back normally if the RTC heap cannot fit it.
+  if (!_upload.buffer) _upload.buffer = static_cast<uint8_t*>(
+      heap_caps_malloc(UploadState::kBufferSize, MALLOC_CAP_RTCRAM | MALLOC_CAP_8BIT));
   if (!_upload.buffer) _upload.buffer = static_cast<uint8_t*>(malloc(UploadState::kBufferSize));
+#if defined(FLOWE_TRANSFER_MEMORY_PROBE)
+  Serial.printf("[streamprobe] scratch=%p dmaFree=%lu rtcFree=%lu\n", _upload.buffer,
+      (unsigned long)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      (unsigned long)heap_caps_get_free_size(MALLOC_CAP_RTCRAM));
+#endif
   if (!_upload.buffer) {
     Serial.println("[xphone-os] transfer: OOM creating the upload buffer");
     return false;
   }
   _upload.bufferPos = 0;
-  _server.reset(new (std::nothrow) WebServer(80));
-  if (!_server) {
-    Serial.println("[xphone-os] transfer: OOM creating WebServer");
+  class ReservedUploadServer : public WebServer {
+   public:
+    ReservedUploadServer() : WebServer(80) {}
+    bool reserveUpload() {
+      _currentUpload.reset(new (std::nothrow) HTTPUpload());
+#if defined(FLOWE_RAW_UPLOAD)
+      _currentRaw.reset(new (std::nothrow) HTTPRaw());
+      return _currentUpload != nullptr && _currentRaw != nullptr;
+#else
+      return _currentUpload != nullptr;
+#endif
+    }
+  };
+  auto* server = new (std::nothrow) ReservedUploadServer();
+  _server.reset(server);
+  if (!server || !server->reserveUpload()) {
+    Serial.println("[xphone-os] transfer: OOM reserving WebServer upload storage");
     return false;
   }
 
@@ -117,9 +317,27 @@ bool FileTransferServer::begin() {
   _server->on("/download", HTTP_GET, [this] { handleDownload(); });
   _server->on("/delete", HTTP_POST, [this] { handleDelete(); });
   _server->on("/stats", HTTP_GET, [this] {
-    // Reading stats snapshot (pages/minutes per day + per book). ~1 KB JSON,
-    // built from the resident store — no SD read on the request path.
-    _server->send(200, "application/json", reader::ReadingStats::toJson().c_str());
+    _requestCount++;
+    // A populated report exceeds 4 KB. Growing its string to 8 KB crashed
+    // a hotspot retry with fragmented heap. Stream the resident records.
+    // Like the shelf listing, stop on the first refused socket write.
+    NetworkClient client = _server->client();
+    client.setNoDelay(true);
+    // Reuse the upload reservation, as in handleManifest. Avoid a socket
+    // write for every small statistics fragment.
+    HttpResponseBatch response(_upload.buffer, _server->version() != "HTTP/1.0",
+        [](void* context, const uint8_t* bytes, size_t length) {
+          return static_cast<NetworkClient*>(context)->write(bytes, length);
+        }, &client);
+    _server->setContentLength(CONTENT_LENGTH_UNKNOWN);
+    _server->send(200, "application/json", "");
+    bool complete = reader::ReadingStats::writeJson(
+        [](const char* bytes, size_t length, void* context) {
+          return static_cast<HttpResponseBatch*>(context)->append(bytes, length);
+        }, &response);
+    if (complete) complete = response.flush();
+    if (complete) _server->sendContent("");
+    else client.stop();
   });
   _server->on("/health", HTTP_GET, [this] {
     // Device memory health for support reports (same numbers as the 60 s
@@ -139,6 +357,40 @@ bool FileTransferServer::begin() {
   });
   _server->on(
       "/upload", HTTP_POST, [this] { handleUploadDone(); }, [this] { handleUploadData(); });
+#if defined(FLOWE_RAW_UPLOAD)
+  gResumeStorage.configure(_upload.buffer, _upload.bufferCapacity);
+  gResumeStorage.recoverPublication = recoverUploadPublication;
+  gResumeStorage.publish = publishUpload;
+  gResumeStorage.publicationComplete = finishResumeBook;
+  _server->on("/api/upload-resume/start", HTTP_POST, [this] { handleResumeControl(0); });
+  _server->on("/api/upload-resume/status", HTTP_GET, [this] { handleResumeControl(1); });
+  _server->on("/api/upload-resume/cancel", HTTP_POST, [this] { handleResumeControl(2); });
+  _server->on("/api/upload-resume/reset", HTTP_POST, [this] { handleResumeControl(3); });
+  auto* rawHandler = new (std::nothrow) RawUploadHandler(
+      [this](HTTPRaw& raw) { handleRawUpload(raw); },
+      [this] {
+        if (_resumeRawRequest) {
+          if (_resumeRawComplete) sendResumeResult(_resumeResult);
+          else _server->send(400, "application/json", "{\"error\":\"Incomplete resume body\"}");
+          _resumeRawRequest = _resumeRawComplete = false;
+          return;
+        }
+        // A multipart body sent to this route must never reuse a
+        // previous upload result or claim that it wrote a file.
+        if (!_rawUploadComplete) {
+          _server->send(400, "text/plain", "Expected one raw upload");
+          return;
+        }
+        _rawUploadComplete = false;
+        handleUploadDone();
+      });
+  if (!rawHandler) {
+    Serial.println("[xphone-os] transfer: OOM reserving raw handler");
+    return false;
+  }
+  _server->addHandler(rawHandler);
+  Serial.printf("[raw-upload] reservedBytes=%u maxBodyBytes=67108864\n", static_cast<unsigned>(sizeof(HTTPRaw)));
+#endif
   // End-of-session from the phone. BLE is down for the whole Wi-Fi session,
   // so "stop" must arrive over HTTP. Until 2026-09-04 this handler called
   // esp_restart() directly; now it only raises stopRequested() and the
@@ -160,18 +412,57 @@ bool FileTransferServer::begin() {
   _server->onNotFound([this] { _server->send(404, "text/plain", "Not found"); });
 
   {
-    const char* headerKeys[] = {"X-Flowe-Token"};
-    _server->collectHeaders(headerKeys, 1);
+#if defined(FLOWE_RAW_UPLOAD)
+    const char* headerKeys[] = {"X-Flowe-Token", "X-Flowe-Reader-Id", "Content-Type",
+      "X-Flowe-Resume-Id", "X-Flowe-Resume-Secret", "X-Flowe-Resume-Offset",
+      "X-Flowe-Resume-Size", "X-Flowe-Resume-SHA256", "X-Flowe-Resume-Reset",
+      "Range", "If-Range", "X-Flowe-Download-Resume"};
+#else
+    const char* headerKeys[] = {"X-Flowe-Token", "X-Flowe-Reader-Id", "Range", "If-Range", "X-Flowe-Download-Resume"};
+#endif
+    _server->collectHeaders(headerKeys, sizeof(headerKeys) / sizeof(headerKeys[0]));
   }
+  _server->addMiddleware([this](WebServer& server, Middleware::Callback next) {
+    if (server.uri() == "/api/status" || targetReaderOk()) {
+#if defined(FLOWE_SYNC_FAST_SDK)
+      // Large TCP windows need the released display RAM. Discovery and stop
+      // remain usable before activation; payload routes require that boundary.
+      if (!transfer_sync::memoryReleased() &&
+          server.uri() != "/api/status" && server.uri() != "/stop" && server.uri() != "/") {
+        server.send(503, "text/plain", "Get reader status before file transfer");
+        return true;
+      }
+#endif
+#if defined(FLOWE_TRANSFER_MEMORY_PROBE)
+      Serial.printf("[netmem-request] %s\n", server.uri().c_str());
+      const String uri = server.uri();
+      allocationProbePhase(uri == "/stats" ? 4 : uri == "/api/files" ? 3 :
+                           uri == "/download" ? 5 : uri == "/upload" ? 6 :
+                           uri == "/api/manifest" ? 7 : uri == "/stop" ? 8 : 2);
+      transferNetworkMemoryProbe("request-before");
+      const bool result = next();
+      transferNetworkMemoryProbe("request-after");
+      allocationProbePhase(0);
+      return result;
+#else
+      return next();
+#endif
+    }
+    server.send(409, "application/json", "{\"error\":\"reader-mismatch\"}");
+    return true;
+  });
   _server->begin();
   _running = true;
   _stopRequested = false;
+  _ownerTransferAborted = false;
   _bytesUploaded = 0;
   _bytesDownloaded = 0;
   _requestCount = 0;
   // A .part left by a reset mid-upload has no owner. Sweep them at every
   // session start so the card never carries a stub for long.
   if (SdMan.ready() || SdMan.begin()) {
+    if (!recoverUploadPublication())
+      Serial.println("[xphone-os] transfer: upload recovery pending; prior bytes retained");
     FsFile dir = SdMan.open("/books", O_RDONLY);
     if (dir && dir.isDir()) {
       FsFile f;
@@ -191,11 +482,21 @@ bool FileTransferServer::begin() {
     }
   }
   Serial.printf("[xphone-os] transfer: HTTP server up, free heap %u\n", static_cast<unsigned>(ESP.getFreeHeap()));
+  transferMemoryProbe("server-ready");
   return true;
 }
 
 void FileTransferServer::stop() {
-  if (gUploadFile) gUploadFile.close();
+  if (gUploadFile) closeUploadFile();
+  releaseUploadBatch();
+#if defined(FLOWE_RAW_UPLOAD)
+  gResumeUpload.abort();
+  gResumeStorage.configure(nullptr, 0);
+  _resumeRawRequest = _resumeRawComplete = false;
+  _rawUploadActive = false;
+  _rawUploadComplete = false;
+  _rawExpectedBytes = 0;
+#endif
   if (_upload.buffer) {
     free(_upload.buffer);
     _upload.buffer = nullptr;
@@ -206,13 +507,45 @@ void FileTransferServer::stop() {
     _server.reset();
   }
   _running = false;
+  transferMemoryStop();
 }
 
 bool FileTransferServer::isolate = false;
 
 void FileTransferServer::handleClient() {
   if (isolate) return;  // bench: a network where nobody can reach us
-  if (_running && _server) _server->handleClient();
+  if (_running && _server) {
+    // Preserve the small startup reservation. Grow only after the screen
+    // buffer has been released, before entering any HTTP handler. Failure
+    // retains the working 4 KiB path; this allocation is tried once/session.
+    // X4 bench: larger sequential I/O improves both directions. Keep X3
+    // at its measured 4 KiB setting until its memory budget is tested.
+    if (!_upload.bufferGrowthTried && transfer_sync::memoryReleased() &&
+        BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX4) {
+      _upload.bufferGrowthTried = true;
+      constexpr size_t kTransferBufferBytes = 16384;
+      uint8_t* larger = static_cast<uint8_t*>(malloc(kTransferBufferBytes));
+      if (larger) {
+        free(_upload.buffer);
+        _upload.buffer = larger;
+        _upload.bufferCapacity = kTransferBufferBytes;
+      }
+      Serial.printf("[xphone-os] transfer: scratch=%u growth=%s heap=%u\n",
+                    static_cast<unsigned>(_upload.bufferCapacity), larger ? "ok" : "fallback", ESP.getFreeHeap());
+    }
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+    const int64_t started = esp_timer_get_time();
+#endif
+    transfer_sync::setHandlingHttp(true);
+    _server->handleClient();
+    transfer_sync::setHandlingHttp(false);
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+    if (_uploadProfile.active) {
+      reportUploadProfile(static_cast<uint64_t>(esp_timer_get_time() - started));
+      _uploadProfile.active = false;
+    }
+#endif
+  }
 }
 
 const char* FileTransferServer::lastUri() const {
@@ -312,12 +645,49 @@ void FileTransferServer::handleRoot() {
 
 void FileTransferServer::handleStatus() {
   _requestCount++;
-  JsonDocument doc;
-  {
-    extern bool gDeviceIsX3;  // DeviceKind.h; set at boot
-    doc["device"] = gDeviceIsX3 ? "X3" : "X4";
+  const String suppliedToken = _server->header("X-Flowe-Token");
+  const String suppliedReader = _server->header("X-Flowe-Reader-Id");
+  char readerId[WifiCreds::kReaderIdSize] = {};
+  const bool haveReaderId = WifiCreds::readerId(readerId, sizeof(readerId));
+  const auto authorization = flowe_status::authorize(
+      {suppliedToken.c_str(), suppliedToken.length()}, {suppliedReader.c_str(), suppliedReader.length()},
+      {gSessionToken, strlen(gSessionToken)}, {readerId, haveReaderId ? strlen(readerId) : 0}, gOwnedReadiness);
+  if (!authorization.allowed) {
+    _server->send(401, "application/json", "{\"error\":\"status-authorization-required\"}");
+    return;
   }
+  const bool verified = authorization.prepareMemory;
+  if (verified) {
+    _verifiedContact = true;
+    // The owner starts its next request as soon as it sees status200.
+    // Prepare RAM before allocating or sending that ready response.
+    if (!prepareStatusHook || !prepareStatusHook(prepareStatusContext)) {
+      _server->send(503, "text/plain", "Reader not ready; retry status");
+      return;
+    }
+#if defined(FLOWE_SYNC_FAST_SDK)
+    if (!transfer_sync::memoryReleased()) {
+      _server->send(503, "text/plain", "Reader sync memory unavailable");
+      return;
+    }
+#endif
+  }
+  // Public discovery on an owned server does not prepare payload RAM.
+  // Guest/bench status retains its legacy preparation but is never paired
+  // readiness: only sessionVerified grants that meaning to the client.
+  JsonDocument doc;
+  doc["sessionVerified"] = authorization.sessionVerified;
+  if (haveReaderId) doc["readerId"] = readerId;
+  doc["device"] = deviceKindUpper();
   doc["version"] = XPHONE_VERSION;
+  if (verified) doc["downloadRangeVersion"] = 1;
+#if defined(FLOWE_RAW_UPLOAD)
+  if (verified) {
+    doc["rawUploadVersion"] = 1;
+    if (gSessionToken[0]) doc["uploadResumeVersion"] = 1;
+    doc["compactPageVersion"] = 1;  // FBPK9 / min_reader6 / codec2
+  }
+#endif
   // Longest the main loop has been stuck this run. A healthy device reports
   // 0; anything here means the card, or something on it, is slow enough for
   // the owner to notice — which is the question their report starts with.
@@ -330,7 +700,7 @@ void FileTransferServer::handleStatus() {
   doc["mode"] = apMode ? "AP" : "STA";
   doc["ip"] = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   doc["freeHeap"] = ESP.getFreeHeap();
-  char out[256];
+  char out[320];
   serializeJson(doc, out, sizeof(out));
   _server->send(200, "application/json", out);
 }
@@ -439,8 +809,21 @@ void FileTransferServer::handleFileList() {
 
 void FileTransferServer::handleDownload() {
   _requestCount++;
+  // Middleware already checks identity, but its legacy String comparison
+  // permits a matching prefix before NUL. Downloads require the exact
+  // 12-byte supplied identity before opening any source or hashing bytes.
+  const String requestedReader = _server->header("X-Flowe-Reader-Id");
+  if (requestedReader.length() && (requestedReader.length() != 12 || !targetReaderOk())) {
+    _server->send(409, "text/plain", "Reader identity mismatched");
+    return;
+  }
   char path[192];
   if (!queryPath(path, sizeof(path), /*required=*/true)) return;
+#if defined(FLOWE_BENCH_TRANSFER_FLUSH_BARRIER)
+  // Finish the prior display transfer before opening/reading the file or
+  // sending its response. The ordinary main loop and repaints stay active.
+  waitTransferDisplay("download-start");
+#endif
 
   FsFile file = SdMan.open(path, O_RDONLY);
   if (!file) {
@@ -474,9 +857,86 @@ void FileTransferServer::handleDownload() {
   char disposition[224];
   snprintf(disposition, sizeof(disposition), "attachment; filename=\"%s\"", filename);
 
-  _server->setContentLength(file.fileSize());
+  const uint64_t sourceBytes = file.fileSize();
+  if (sourceBytes > SIZE_MAX) {
+    file.close();
+    _server->send(413, "text/plain", "File exceeds response size limit");
+    return;
+  }
+  uint8_t* const buffer = _upload.buffer;
+#if defined(FLOWE_BENCH_DOWNLOAD_CHUNK)
+  constexpr size_t kBufSize = FLOWE_BENCH_DOWNLOAD_CHUNK;
+  static_assert(kBufSize > 0 && kBufSize <= UploadState::kBufferSize);
+#else
+  const size_t kBufSize = _upload.bufferCapacity;
+#endif
+  const String range = _server->header("Range");
+  const String ifRange = _server->header("If-Range");
+  const String resumeOption = _server->header("X-Flowe-Download-Resume");
+  if (resumeOption.length() && resumeOption != "1") {
+    file.close();
+    _server->send(400, "text/plain", "Invalid download resume option");
+    return;
+  }
+  flowe_download::Plan selected{200, 0, sourceBytes, sourceBytes};
+  uint32_t hashElapsedMs = 0;
+  // Legacy cover/source fanout retains its single SD pass. A new client
+  // opts in on its first full download, then saves this strong ETag for
+  // Range + If-Range retries. Range itself also selects this safe path.
+  if (resumeOption.length() || range.length() || ifRange.length()) {
+    char etag[67];
+    flowe_resume::Sha256 hash;
+    const uint32_t hashStartedAt = millis();
+    const auto hashed = flowe_download::makeETag(file, hash, sourceBytes, buffer, kBufSize, etag,
+        transfer_sync::pollControls, [] { esp_task_wdt_reset(); yield(); });
+    if (hashed != flowe_download::HashResult::ok) {
+      file.close();
+      _server->send(hashed == flowe_download::HashResult::cancelled ? 503 : 500, "text/plain",
+                    hashed == flowe_download::HashResult::cancelled ? "Download cancelled" : "Cannot verify download source");
+      return;
+    }
+    hashElapsedMs = millis() - hashStartedAt;
+    selected = flowe_download::plan(sourceBytes,
+        {range.c_str(), range.length()}, {ifRange.c_str(), ifRange.length()}, etag);
+    _server->sendHeader("Accept-Ranges", "bytes");
+    _server->sendHeader("ETag", etag);
+    _server->sendHeader("Cache-Control", "no-transform");
+  }
+  char contentRange[96];
+  if (selected.status == 416) {
+    snprintf(contentRange, sizeof(contentRange), "bytes */%llu", static_cast<unsigned long long>(sourceBytes));
+    _server->sendHeader("Content-Range", contentRange);
+    _server->setContentLength(0);
+    _server->send(416, "application/octet-stream", "");
+    file.close();
+    return;
+  }
+  if (!file.seekSet(selected.first)) {
+    file.close();
+    _server->send(500, "text/plain", "Cannot seek download source");
+    return;
+  }
+  if (selected.status == 206) {
+    snprintf(contentRange, sizeof(contentRange), "bytes %llu-%llu/%llu",
+        static_cast<unsigned long long>(selected.first),
+        static_cast<unsigned long long>(selected.first + selected.length - 1),
+        static_cast<unsigned long long>(sourceBytes));
+    _server->sendHeader("Content-Range", contentRange);
+  }
+  const size_t expectedBytes = size_t(selected.length);
+  uint64_t remainingBytes = selected.length;
+  const bool ownedBySession = tokenOk();
+  size_t sentBytes = 0;
+  size_t nextProgress = 1024 * 1024;
+  const uint32_t startedAt = millis();
+  uint32_t longestReadMs = 0, longestWriteMs = 0;
+  const char* failure = "short file";
+  Serial.printf("[xphone-os] transfer: download start '%s' (%u bytes) status=%u offset=%lu hashMs=%lu\n",
+                path, (unsigned)expectedBytes, selected.status, static_cast<unsigned long>(selected.first),
+                static_cast<unsigned long>(hashElapsedMs));
+  _server->setContentLength(expectedBytes);
   _server->sendHeader("Content-Disposition", disposition);
-  _server->send(200, hasEpubExtension(path) ? "application/epub+zip" : "application/octet-stream", "");
+  _server->send(selected.status, hasEpubExtension(path) ? "application/epub+zip" : "application/octet-stream", "");
 
   // 4 KB chunked streaming, CrossPoint handleDownload pattern
   // (x4-os CrossPointWebServer.cpp:548-569). Reuses the upload batch buffer:
@@ -484,27 +944,73 @@ void FileTransferServer::handleDownload() {
   // download stream can never be in flight together — a second static 4 KB
   // here was pure BSS duplication.
   NetworkClient client = _server->client();
-  uint8_t* const buffer = _upload.buffer;
-  constexpr size_t kBufSize = UploadState::kBufferSize;
+#if defined(FLOWE_BENCH_DOWNLOAD_COALESCE)
+  // Bench-only: allow TCP to coalesce short segments during the bulk body.
+  // Keep the application write size and all other routes unchanged.
+  const int coalesceRc = client.setNoDelay(false);
+  Serial.printf("[download-coalesce] setNoDelay(false) rc=%d getNoDelay=%d\n",
+                coalesceRc, client.getNoDelay() ? 1 : 0);
+#endif
   bool ok = true;
-  while (ok && file.available()) {
-    const int result = file.read(buffer, kBufSize);
-    if (result <= 0) break;
+  while (ok && remainingBytes) {
+    if (transfer_sync::pollControls()) { failure = "cancelled"; ok = false; break; }
+    const uint32_t readAt = millis();
+    const int result = flowe_download::readBounded(file, buffer, kBufSize, remainingBytes);
+    longestReadMs = max(longestReadMs, millis() - readAt);
+    if (result <= 0) { failure = "SD read"; break; }
     size_t sent = 0;
     while (sent < static_cast<size_t>(result)) {
       esp_task_wdt_reset();
-      const size_t wrote = client.write(buffer + sent, result - sent);
-      if (wrote == 0) {
+      const uint32_t writeAt = millis();
+      const auto write = transfer_sync::writeControlled(buffer + sent, result - sent, client.getTimeout(),
+          [&client](const uint8_t* bytes, size_t count) {
+            if (client.fd() < 0) return -1;
+            const int n = ::send(client.fd(), bytes, count, MSG_DONTWAIT);
+            if (n > 0) return n;
+            return n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 0 : -1;
+          }, [] { return millis(); }, [](unsigned ms) { delay(ms); }, transfer_sync::pollControls);
+      const size_t wrote = write.bytes;
+      const uint32_t writeMs = millis() - writeAt;
+      longestWriteMs = max(longestWriteMs, writeMs);
+#if defined(FLOWE_TRANSFER_MEMORY_PROBE)
+      if (writeMs >= 1000 || wrote == 0) {
+        Serial.printf("[streamprobe] bytes=%lu requested=%u wrote=%u elapsed=%lu\n",
+            (unsigned long)sentBytes, (unsigned)(result - sent), (unsigned)wrote, (unsigned long)writeMs);
+        transferNetworkMemoryProbe("write-stall");
+      }
+#endif
+      sent += wrote;
+      _bytesDownloaded += wrote;
+      sentBytes += wrote;
+      if (!write.complete) {
+        failure = transfer_sync::cancelRequested() ? "cancelled" : "socket write";
         ok = false;
         break;
       }
-      sent += wrote;
-      _bytesDownloaded += wrote;
+    }
+    if (sentBytes >= nextProgress) {
+      transferMemoryProbe("download-progress", sentBytes);
+      Serial.printf("[xphone-os] transfer: download progress %u/%u bytes, %u ms, heap %u\n",
+                    (unsigned)sentBytes, (unsigned)expectedBytes, (unsigned)(millis() - startedAt),
+                    (unsigned)ESP.getFreeHeap());
+      nextProgress = sentBytes + 1024 * 1024;
     }
     yield();
   }
-  client.clear();
+  const bool complete = ok && sentBytes == expectedBytes;
+  if (complete) client.clear();
+  else abortFailedDownload(client);
   file.close();
+  transferMemoryProbe("download-complete", sentBytes);
+  Serial.printf("[xphone-os] transfer: download %s '%s' (%u/%u bytes)\n",
+                complete ? "complete" : "interrupted", path,
+                (unsigned)sentBytes, (unsigned)expectedBytes);
+  Serial.printf("[xphone-os] transfer: download result=%s elapsed=%u ms maxRead=%u ms maxWrite=%u ms heap=%u\n",
+                complete ? "ok" : failure, (unsigned)(millis() - startedAt),
+                (unsigned)longestReadMs, (unsigned)longestWriteMs, (unsigned)ESP.getFreeHeap());
+  // A guest can download too. Only the authenticated session owner may
+  // cause the scene to leave STA after a broken stream.
+  if (!complete && ownedBySession) _ownerTransferAborted = true;
 }
 
 // Canonical book key: drop a container extension, keep ASCII letters and
@@ -691,26 +1197,442 @@ void FileTransferServer::handleDelete() {
   }
 }
 
+uint8_t* FileTransferServer::uploadWriteBuffer() {
+#if defined(FLOWE_BENCH_UPLOAD_BATCH_16K)
+  if (_upload.largeBatch) return _upload.largeBatch;
+#endif
+  return _upload.buffer;
+}
+
+size_t FileTransferServer::uploadWriteCapacity() const {
+#if defined(FLOWE_BENCH_UPLOAD_BATCH_16K)
+  if (_upload.largeBatch) return 16384;
+#endif
+  return _upload.bufferCapacity;
+}
+
+void FileTransferServer::releaseUploadBatch() {
+#if defined(FLOWE_BENCH_UPLOAD_BATCH_16K)
+  free(_upload.largeBatch);
+  _upload.largeBatch = nullptr;
+#endif
+}
+
+void FileTransferServer::closeUploadFile() {
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+  if (_uploadProfile.active) {
+    UploadDuration duration(_uploadProfile.sdCloseSyncUs);
+    ++_uploadProfile.closeCalls;
+    if (!gUploadFile.close()) {
+      ++_uploadProfile.closeFailures;
+      _upload.failed = true;
+    }
+    return;
+  }
+#endif
+  if (!gUploadFile.close()) _upload.failed = true;
+}
+
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+void FileTransferServer::reportUploadProfile(const uint64_t handlerUs) {
+  const auto& p = _uploadProfile;
+  // Callback time begins after the watchdog/reader check and contains
+  // SD/progress time. The remaining handler time includes parsing, receive
+  // waits, scheduling and response work together, not only network time.
+  Serial.printf("[upload-profile] handlerCallUs=%llu callbackUs=%llu responseUs=%llu batchBytes=%u failed=%u countersBytes=%u\n",
+                static_cast<unsigned long long>(handlerUs), static_cast<unsigned long long>(p.callbackUs),
+                static_cast<unsigned long long>(p.responseUs), p.batchBytes, _upload.failed ? 1u : 0u,
+                static_cast<unsigned>(sizeof(UploadProfile)));
+  Serial.printf("[upload-profile] sdWriteUs=%llu sdWriteCalls=%u sdWrittenBytes=%llu shortWrites=%u sdCloseSyncUs=%llu closeCalls=%u closeFailures=%u explicitSyncCalls=0 progressUs=%llu progressCalls=%u responseCalls=%u\n",
+                static_cast<unsigned long long>(p.sdWriteUs), p.writeCalls,
+                static_cast<unsigned long long>(p.writtenBytes), p.shortWrites,
+                static_cast<unsigned long long>(p.sdCloseSyncUs), p.closeCalls, p.closeFailures,
+                static_cast<unsigned long long>(p.progressUs), p.progressCalls, p.responseCalls);
+  Serial.printf("[upload-profile] callbacksStartWriteEndAbort=%u,%u,%u,%u payloadBytes=%llu payloadMin=%u payloadMax=%u sizesZeroLt512Lt1436Eq1436Gt1436=%u,%u,%u,%u,%u\n",
+                p.callbacks[0], p.callbacks[1], p.callbacks[2], p.callbacks[3],
+                static_cast<unsigned long long>(p.payloadBytes),
+                p.payloadMin == UINT32_MAX ? 0u : p.payloadMin, p.payloadMax,
+                p.payloadSizes[0], p.payloadSizes[1], p.payloadSizes[2], p.payloadSizes[3], p.payloadSizes[4]);
+  Serial.printf("[upload-profile] callbackStartWriteEndAbortUs=%llu,%llu,%llu,%llu\n",
+                static_cast<unsigned long long>(p.callbackStageUs[0]), static_cast<unsigned long long>(p.callbackStageUs[1]),
+                static_cast<unsigned long long>(p.callbackStageUs[2]), static_cast<unsigned long long>(p.callbackStageUs[3]));
+}
+#endif
+
 bool FileTransferServer::flushUploadBuffer() {
   if (_upload.bufferPos == 0 || !gUploadFile) return true;
   esp_task_wdt_reset();  // SD writes can be slow (FAT cluster allocation)
-  const size_t written = gUploadFile.write(_upload.buffer, _upload.bufferPos);
+  size_t written;
+  {
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+    UploadDuration duration(_uploadProfile.sdWriteUs);
+#endif
+    written = gUploadFile.write(uploadWriteBuffer(), _upload.bufferPos);
+  }
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+  ++_uploadProfile.writeCalls;
+  _uploadProfile.writtenBytes += written;
+  if (written != _upload.bufferPos) ++_uploadProfile.shortWrites;
+#endif
   const bool ok = written == _upload.bufferPos;
   _upload.bufferPos = 0;
   return ok;
 }
 
+
+#if defined(FLOWE_RAW_UPLOAD)
+bool FileTransferServer::resumeAuthorized() {
+  // Unlike legacy guest uploads, every resume operation needs both the
+  // fresh BLE-issued session token and the exact reader identity.
+  const String target = _server->header("X-Flowe-Reader-Id");
+  if (!gSessionToken[0] || !tokenOk() || target.length() != 12 || !targetReaderOk()) {
+    _server->send(401, "application/json", "{\"error\":\"Resume authorization required\"}");
+    return false;
+  }
+#if defined(FLOWE_SYNC_FAST_SDK)
+  if (!transfer_sync::memoryReleased()) {
+    _server->send(503, "application/json", "{\"error\":\"Get reader status first\"}");
+    return false;
+  }
+#endif
+  _verifiedContact = true;
+  // handleClient can replace the transfer buffer after the readiness
+  // barrier. Never retain its old address across separate requests.
+  gResumeStorage.configure(_upload.buffer, _upload.bufferCapacity);
+  return true;
+}
+
+void FileTransferServer::sendResumeResult(int value) {
+  using flowe_resume::Result;
+  const Result result = Result(value);
+  _requestCount++;
+  _server->sendHeader("Cache-Control", "no-store");
+  if (result != Result::ok) {
+    int code = 500;
+    const char* error = "Resume storage error";
+    switch (result) {
+      case Result::notFound: code = 404; error = "Resume slot not found"; break;
+      case Result::invalid: code = 400; error = "Invalid resume request"; break;
+      case Result::unauthorized: code = 401; error = "Resume identity mismatch"; break;
+      case Result::conflict: code = 409; error = "Resume slot, content, or offset conflict"; break;
+      case Result::hashMismatch: code = 422; error = "Resume content checksum mismatch"; break;
+      default: break;
+    }
+    char response[112];
+    snprintf(response, sizeof(response), "{\"error\":\"%s\"}", error);
+    _server->send(code, "application/json", response);
+    return;
+  }
+  const auto& record = gResumeUpload.record();
+  using flowe_resume::State;
+  const char* status = gResumeUpload.state() == State::complete ? "complete" :
+      gResumeUpload.state() == State::cancelled ? "cancelled" :
+      gResumeUpload.state() == State::failed ? "failed" : "receiving";
+  char response[256];
+  snprintf(response, sizeof(response),
+      "{\"id\":\"%s\",\"status\":\"%s\",\"offset\":%lu,\"size\":%lu,\"sha256\":\"%s\"}",
+      record.id, status, static_cast<unsigned long>(record.offset),
+      static_cast<unsigned long>(record.size), record.sha256);
+  _server->send(200, "application/json", response);
+}
+
+int FileTransferServer::startResumeFromRequest(bool initialBody) {
+  using flowe_resume::Result;
+  const String reader = _server->header("X-Flowe-Reader-Id");
+  const String id = _server->header("X-Flowe-Resume-Id");
+  const String secret = _server->header("X-Flowe-Resume-Secret");
+  const String directory = _server->arg("path");
+  const String name = _server->arg("name");
+  const String sizeText = _server->header("X-Flowe-Resume-Size");
+  const String digest = _server->header("X-Flowe-Resume-SHA256");
+  uint32_t size = 0;
+  if (directory.length() == 0 || directory.length() > 126 || name.length() == 0 || name.length() > 96 ||
+      strlen(directory.c_str()) != directory.length() || strlen(name.c_str()) != name.length() ||
+      name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 ||
+      sizeText.length() > 10 || strlen(sizeText.c_str()) != sizeText.length() || digest.length() != 64 ||
+      !flowe_resume::decimal(sizeText.c_str(), size)) {
+    return int(Result::invalid);
+  }
+  char target[192];
+  const int length = snprintf(target, sizeof(target), "%s/%s", directory.c_str(), name.c_str());
+  if (length < 0 || size_t(length) >= sizeof(target)) { return int(Result::invalid); }
+  if (initialBody && size != _server->clientContentLength()) return int(Result::invalid);
+  return int(gResumeUpload.start(reader.c_str(), target, size, digest.c_str(), id.c_str(), secret.c_str(), initialBody));
+}
+
+void FileTransferServer::handleResumeControl(unsigned action) {
+  using flowe_resume::Result;
+  if (!resumeAuthorized()) return;
+  if (action == 3) {
+    const String intent = _server->header("X-Flowe-Resume-Reset");
+    if (intent.length() != 7 || intent != "discard") {
+      sendResumeResult(int(Result::invalid)); return;
+    }
+    const Result result = gResumeUpload.reset();
+    if (result != Result::ok) { sendResumeResult(int(result)); return; }
+    _requestCount++;
+    _server->sendHeader("Cache-Control", "no-store");
+    _server->send(200, "application/json", "{\"reset\":true}");
+    return;
+  }
+  const String reader = _server->header("X-Flowe-Reader-Id");
+  const String id = _server->header("X-Flowe-Resume-Id");
+  const String secret = _server->header("X-Flowe-Resume-Secret");
+  if (id.length() != 32 || secret.length() != 64 ||
+      !flowe_resume::hex(id.c_str(), 32) || !flowe_resume::hex(secret.c_str(), 64)) {
+    sendResumeResult(int(Result::invalid)); return;
+  }
+  Result result;
+  if (action == 0) {
+    result = Result(startResumeFromRequest(false));
+  } else if (action == 1) {
+    result = gResumeUpload.status(reader.c_str(), id.c_str(), secret.c_str());
+  } else {
+    result = gResumeUpload.cancel(reader.c_str(), id.c_str(), secret.c_str());
+  }
+  sendResumeResult(int(result));
+}
+
+void FileTransferServer::handleResumeRaw(HTTPRaw& raw) {
+  using flowe_resume::Result;
+  auto reject = [this](Result result) {
+    gResumeUpload.abort();
+    _resumeRawComplete = false;
+    sendResumeResult(int(result));
+    _server->client().stop();
+  };
+  if (raw.status == RAW_START) {
+    _resumeRawComplete = false;
+    _resumeBodyReceived = 0;
+    if (!resumeAuthorized()) { _server->client().stop(); return; }
+    const String reader = _server->header("X-Flowe-Reader-Id");
+    const String id = _server->header("X-Flowe-Resume-Id");
+    const String secret = _server->header("X-Flowe-Resume-Secret");
+    const String offsetText = _server->header("X-Flowe-Resume-Offset");
+    uint32_t offset = 0;
+    const size_t length = _server->clientContentLength();
+    if (id.length() != 32 || secret.length() != 64 || !flowe_resume::hex(id.c_str(), 32) ||
+        !flowe_resume::hex(secret.c_str(), 64) || offsetText.length() > 10 ||
+        strlen(offsetText.c_str()) != offsetText.length() || !flowe_resume::decimal(offsetText.c_str(), offset) ||
+        _server->header("Content-Type") != "application/octet-stream" || !length || length > flowe_resume::kMaxBytes) {
+      reject(Result::invalid); return;
+    }
+    _rawExpectedBytes = uint32_t(length);
+    if (_server->hasHeader("X-Flowe-Resume-Size") || _server->hasHeader("X-Flowe-Resume-SHA256")) {
+      // A foreground-created OS background cohort can queue complete book
+      // requests now. Each request creates its own slot only when the
+      // single-client server reaches it after the previous book completes.
+      if (offset != 0) { reject(Result::conflict); return; }
+      const Result started = Result(startResumeFromRequest(true));
+      if (started != Result::ok) { reject(started); return; }
+    }
+    const Result result = gResumeUpload.begin(reader.c_str(), id.c_str(), secret.c_str(), offset, _rawExpectedBytes);
+    if (result != Result::ok) { reject(result); return; }
+    _hookMark = _bytesUploaded;
+    if (progressHook) progressHook();
+    return;
+  }
+  if (!gResumeUpload.active()) return;
+  if (raw.status == RAW_WRITE) {
+    if (!raw.currentSize || raw.totalSize != _resumeBodyReceived + raw.currentSize || raw.totalSize > _rawExpectedBytes) {
+      reject(Result::invalid); return;
+    }
+    const Result result = gResumeUpload.append(raw.buf, raw.currentSize);
+    if (result != Result::ok) { reject(result); return; }
+    _resumeBodyReceived += raw.currentSize;
+    _bytesUploaded += raw.currentSize;
+    if (progressHook && _bytesUploaded - _hookMark >= 4u * 1024u * 1024u) {
+      _hookMark = _bytesUploaded;
+      progressHook();
+    }
+  } else if (raw.status == RAW_END) {
+    if (raw.totalSize != _rawExpectedBytes || _resumeBodyReceived != _rawExpectedBytes) { reject(Result::invalid); return; }
+    _resumeResult = int(gResumeUpload.finish());
+    _resumeRawComplete = true;
+    Serial.printf("[resume-upload] body finished bytes=%lu result=%d\n",
+                  static_cast<unsigned long>(_resumeBodyReceived), _resumeResult);
+  } else if (raw.status == RAW_ABORTED) {
+    gResumeUpload.abort();
+    _resumeRawComplete = false;
+    // Retain this Wi-Fi session for a retry. Legacy uploads still use the
+    // old abort flag. This path owns a durable checkpoint and its secret.
+    Serial.println("[resume-upload] interrupted; checkpoint retained");
+  }
+}
+
+void FileTransferServer::rejectRawUpload(const char* reason, int code) {
+  // Only map ABORT when this request entered START. No stale path is removed
+  // for a rejected header/query. The common abort drops the owned .part.
+  if (_rawUploadActive) {
+    HTTPUpload& upload = _server->upload();
+    upload.status = UPLOAD_FILE_ABORTED;
+    upload.currentSize = 0;
+    handleUploadData();
+  }
+  _rawUploadActive = false;
+  _rawUploadComplete = false;
+  _upload.failed = true;
+  Serial.printf("[raw-upload] rejected: %s\n", reason);
+  _server->send(code, "text/plain", reason);
+  // Do not let the parser read the rejected body. Its next raw read emits
+  // ABORT; the inactive guard below prevents a second file operation.
+  _server->client().stop();
+}
+
+void FileTransferServer::handleRawUpload(HTTPRaw& raw) {
+  if (raw.status == RAW_START) {
+    _resumeRawRequest = _server->hasHeader("X-Flowe-Resume-Id") || _server->hasHeader("X-Flowe-Resume-Secret") ||
+        _server->hasHeader("X-Flowe-Resume-Offset") || _server->hasHeader("X-Flowe-Resume-Size") ||
+        _server->hasHeader("X-Flowe-Resume-SHA256");
+    _resumeRawComplete = false;
+    _rawUploadActive = _rawUploadComplete = false;
+  }
+  if (_resumeRawRequest) { handleResumeRaw(raw); return; }
+  static_assert(HTTP_RAW_BUFLEN <= HTTP_UPLOAD_BUFLEN,
+                "Raw chunks must fit the reserved multipart callback buffer");
+  HTTPUpload& upload = _server->upload();
+#if defined(FLOWE_SYNC_FAST_SDK)
+  if (raw.status == RAW_START && !transfer_sync::memoryReleased()) {
+    rejectRawUpload("Get reader status before file transfer", 503);
+    return;
+  }
+#endif
+  if (raw.status == RAW_START) {
+    _rawUploadActive = false;
+    _rawUploadComplete = false;
+    _rawExpectedBytes = 0;
+    if (!targetReaderOk()) {
+      rejectRawUpload("Reader identity mismatched", 409);
+      return;
+    }
+    if (_server->header("Content-Type") != "application/octet-stream" ||
+        _server->args() != 2 || !_server->hasArg("path") || !_server->hasArg("name")) {
+      rejectRawUpload("Expected octet-stream and path/name arguments", 400);
+      return;
+    }
+    const String name = _server->arg("name");
+    if (_server->clientContentLength() <= 0) {
+      rejectRawUpload("Invalid raw length", 400);
+      return;
+    }
+    _rawExpectedBytes = static_cast<uint32_t>(_server->clientContentLength());
+    upload.status = UPLOAD_FILE_START;
+    upload.name = "file";
+    upload.filename = name;
+    upload.type = "application/octet-stream";
+    upload.totalSize = 0;
+    upload.currentSize = 0;
+    if (upload.filename != name) {
+      rejectRawUpload("Reader busy; filename allocation failed", 503);
+      return;
+    }
+    _rawUploadActive = true;
+    handleUploadData();
+    if (_upload.failed || !_upload.fileOpen) rejectRawUpload("Raw upload start failed", 400);
+    else if (_rawExpectedBytes >= 5744 &&
+             BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX4) {
+      // Keep prefetched body bytes. Allocation failure retains the old buffer.
+      _server->client().floweGrowReadBuffer(5744);
+    }
+    return;
+  }
+  if (!_rawUploadActive) return;
+  if (raw.status == RAW_WRITE) {
+    if (_upload.failed || raw.currentSize == 0 || raw.currentSize > sizeof(upload.buf) ||
+        raw.totalSize > _rawExpectedBytes ||
+        raw.totalSize != _upload.received + raw.currentSize) {
+      rejectRawUpload("Raw byte count mismatch", 400);
+      return;
+    }
+    memcpy(upload.buf, raw.buf, raw.currentSize);
+    upload.status = UPLOAD_FILE_WRITE;
+    upload.currentSize = raw.currentSize;
+    upload.totalSize = raw.totalSize;
+    handleUploadData();
+    if (_upload.failed) rejectRawUpload("Raw SD write failed", 500);
+  } else if (raw.status == RAW_END) {
+    if (_upload.failed || raw.totalSize != _rawExpectedBytes || _upload.received != _rawExpectedBytes) {
+      rejectRawUpload("Incomplete raw upload", 400);
+      return;
+    }
+    upload.status = UPLOAD_FILE_END;
+    upload.currentSize = 0;
+    upload.totalSize = raw.totalSize;
+    // The common END checks flush/close before journaled publication.
+    // Multipart and raw bodies use the same failure and recovery rules.
+    handleUploadData();
+    if (_upload.failed) SdMan.remove(_upload.part);
+    _rawUploadActive = false;
+    _rawUploadComplete = true;
+  } else if (raw.status == RAW_ABORTED) {
+    upload.status = UPLOAD_FILE_ABORTED;
+    upload.currentSize = 0;
+    handleUploadData();
+    _rawUploadActive = false;
+    _rawUploadComplete = false;
+  }
+}
+#endif
+
 void FileTransferServer::handleUploadData() {
   esp_task_wdt_reset();
+  // Multipart callbacks run before middleware. Reject every stage before
+  // opening a file, promoting a .part, or changing the owner-abort event.
+  if (!targetReaderOk()) return;
   const HTTPUpload& up = _server->upload();
+#if defined(FLOWE_SYNC_FAST_SDK)
+  if (up.status == UPLOAD_FILE_START && !transfer_sync::memoryReleased()) {
+    _upload.failed = true;
+    _server->client().stop();
+    return;
+  }
+#endif
+  if (transfer_sync::pollControls() && up.status != UPLOAD_FILE_ABORTED) {
+    // No publication on physical/USB cancellation, including a final chunk.
+    _upload.failed = true;
+    _upload.bufferPos = 0;
+    if (_upload.fileOpen) { closeUploadFile(); _upload.fileOpen = false; SdMan.remove(_upload.part); }
+    releaseUploadBatch();
+    _server->client().stop();
+    return;
+  }
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+  if (!_uploadProfile.active) {
+    _uploadProfile = {};
+    _uploadProfile.active = true;
+  }
+  const unsigned status = static_cast<unsigned>(up.status);
+  UploadDuration callbackDuration(_uploadProfile.callbackUs,
+                                  status < 4 ? &_uploadProfile.callbackStageUs[status] : nullptr);
+  if (status < 4) ++_uploadProfile.callbacks[status];
+  if (up.status == UPLOAD_FILE_WRITE) {
+    const uint32_t size = up.currentSize;
+    _uploadProfile.payloadBytes += size;
+    if (size < _uploadProfile.payloadMin) _uploadProfile.payloadMin = size;
+    if (size > _uploadProfile.payloadMax) _uploadProfile.payloadMax = size;
+    const unsigned bucket = size == 0 ? 0 : size < 512 ? 1 : size < 1436 ? 2 : size == 1436 ? 3 : 4;
+    ++_uploadProfile.payloadSizes[bucket];
+  }
+#endif
 
   if (up.status == UPLOAD_FILE_START) {
+    allocationProbePhase(6);
+    transferMemoryProbe("upload-start");
+    // Uploads are open to guests; ending the session is not. Capture the
+    // same authority as /stop before the request's headers go away.
+    _upload.ownedBySession = tokenOk();
+    releaseUploadBatch();
     _upload.bufferPos = 0;
     _upload.failed = false;
     _upload.fileOpen = false;
     _upload.received = 0;
 
     char dir[128];
+    if (_server->arg("path").length() >= sizeof(dir) - 1 ||
+        strlen(_server->arg("path").c_str()) != _server->arg("path").length()) {
+      _upload.failed = true;
+      return;
+    }
     if (!_server->hasArg("path")) {
       snprintf(dir, sizeof(dir), "/books");
     } else {
@@ -720,7 +1642,8 @@ void FileTransferServer::handleUploadData() {
       while (len > 1 && dir[len - 1] == '/') dir[--len] = '\0';
     }
     if (!isSafePath(dir) || up.filename.length() == 0 || isHiddenName(up.filename.c_str()) ||
-        up.filename.indexOf('/') >= 0) {
+        up.filename.indexOf('/') >= 0 || up.filename.indexOf('\\') >= 0 ||
+        up.filename.indexOf("..") >= 0 || strlen(up.filename.c_str()) != up.filename.length()) {
       _upload.failed = true;
       return;
     }
@@ -735,6 +1658,10 @@ void FileTransferServer::handleUploadData() {
     }
     if (!SdMan.exists(dir) && !SdMan.mkdir(dir)) {
       Serial.printf("[xphone-os] transfer: mkdir %s failed\n", dir);
+      _upload.failed = true;
+      return;
+    }
+    if (strlen(dir) + 1 + up.filename.length() >= sizeof(_upload.path)) {
       _upload.failed = true;
       return;
     }
@@ -754,55 +1681,86 @@ void FileTransferServer::handleUploadData() {
       return;
     }
     _upload.fileOpen = true;
+#if defined(FLOWE_BENCH_UPLOAD_BATCH_16K)
+    // Allocate only for this file, after .part opened successfully. Never
+    // resize/reassign the 4 KiB RTC scratch shared by the other handlers.
+    _upload.largeBatch = static_cast<uint8_t*>(malloc(16384));
+    Serial.printf("[upload-batch] requested=16384 selected=%u allocation=%s extraHeap=%u freeHeap=%u\n",
+                  static_cast<unsigned>(uploadWriteCapacity()), _upload.largeBatch ? "ok" : "fallback",
+                  _upload.largeBatch ? 16384u : 0u, ESP.getFreeHeap());
+#endif
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+    _uploadProfile.batchBytes = uploadWriteCapacity();
+#endif
     Serial.printf("[xphone-os] transfer: upload start %s\n", _upload.path);
     _hookMark = _bytesUploaded;
-    if (progressHook) progressHook();
+    if (progressHook) {
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+      UploadDuration duration(_uploadProfile.progressUs);
+      ++_uploadProfile.progressCalls;
+#endif
+      progressHook();
+#if defined(FLOWE_BENCH_TRANSFER_FLUSH_BARRIER)
+      waitTransferDisplay("upload-start-display");
+#endif
+    }
+    transferMemoryProbe("upload-after-open-and-display");
 
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (_upload.failed || !_upload.fileOpen) return;
     const uint8_t* data = up.buf;
     size_t remaining = up.currentSize;
+    uint8_t* const batch = uploadWriteBuffer();
+    const size_t batchSize = uploadWriteCapacity();
     while (remaining > 0) {
-      const size_t space = UploadState::kBufferSize - _upload.bufferPos;
+      const size_t space = batchSize - _upload.bufferPos;
       const size_t toCopy = remaining < space ? remaining : space;
-      memcpy(_upload.buffer + _upload.bufferPos, data, toCopy);
+      memcpy(batch + _upload.bufferPos, data, toCopy);
       _upload.bufferPos += toCopy;
       data += toCopy;
       remaining -= toCopy;
-      if (_upload.bufferPos >= UploadState::kBufferSize && !flushUploadBuffer()) {
+      if (_upload.bufferPos >= batchSize && !flushUploadBuffer()) {
         _upload.failed = true;
-        gUploadFile.close();
+        closeUploadFile();
+        releaseUploadBatch();
         _upload.fileOpen = false;
         SdMan.remove(_upload.part);
         return;
       }
     }
+    const uint32_t priorReceived = _upload.received;
     _upload.received += up.currentSize;
+    if ((priorReceived >> 18) != (_upload.received >> 18))
+      transferMemoryProbe("upload-progress", _upload.received);
     _bytesUploaded += up.currentSize;
     feedLoopWDT();  // a whole book arrives inside one handleClient(); the loop watchdog must not count it as a hang
     // ~4 MB cadence: at bench speed (~165 KB/s) that is one e-ink repaint
     // every ~25 s — visible progress for ~3% throughput cost.
     if (progressHook && _bytesUploaded - _hookMark >= 4u * 1024u * 1024u) {
       _hookMark = _bytesUploaded;
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+      UploadDuration duration(_uploadProfile.progressUs);
+      ++_uploadProfile.progressCalls;
+#endif
       progressHook();
+#if defined(FLOWE_BENCH_TRANSFER_FLUSH_BARRIER)
+      waitTransferDisplay("upload-progress-display");
+#endif
     }
 
   } else if (up.status == UPLOAD_FILE_END) {
+    transferMemoryProbe("upload-before-close", _upload.received);
     if (_upload.fileOpen) {
-      if (!flushUploadBuffer()) _upload.failed = true;
-      gUploadFile.close();
-      _upload.fileOpen = false;
+      const bool completed = flowe_upload::finish(_upload.failed,
+          [this] { return flushUploadBuffer(); },
+          [this] { closeUploadFile(); _upload.fileOpen = false; return !_upload.failed; },
+          [this] { return publishUpload(_upload.part, _upload.path); });
+      _upload.failed = !completed;
+    } else {
+      _upload.failed = true;
     }
-    if (!_upload.failed) {
-      // Promote the .part to the real name, atomically. If a stale file is
-      // there (a replace), drop it first.
-      if (SdMan.exists(_upload.path)) SdMan.remove(_upload.path);
-      if (!SdMan.rename(_upload.part, _upload.path)) {
-        Serial.printf("[xphone-os] transfer: rename %s failed; dropping\n", _upload.part);
-        SdMan.remove(_upload.part);
-        _upload.failed = true;
-      }
-    }
+    releaseUploadBatch();
+    if (_upload.failed) SdMan.remove(_upload.part);
     if (!_upload.failed) {
       Serial.printf("[xphone-os] transfer: upload done %s (%u bytes)\n", _upload.path,
                     static_cast<unsigned>(_upload.received));
@@ -824,12 +1782,14 @@ void FileTransferServer::handleUploadData() {
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     _upload.bufferPos = 0;
     if (_upload.fileOpen) {
-      gUploadFile.close();
+      closeUploadFile();
       _upload.fileOpen = false;
       SdMan.remove(_upload.part);  // drop the partial file
     }
+    releaseUploadBatch();
     _upload.failed = true;
     Serial.println("[xphone-os] transfer: upload aborted");
+    if (_upload.ownedBySession) _ownerTransferAborted = true;
   }
 }
 
@@ -886,7 +1846,29 @@ static void handoffEpubPosition(const char* epubPath, const char* fbpPath) {
                 (unsigned long)p32, posPath);
 }
 
+#if defined(FLOWE_RAW_UPLOAD)
+static bool finishResumeBook(const char* path) {
+  if (!hasFbpExtension(path)) return true;
+  char side[196];
+  for (const char* extension : {".cov", ".str"}) {
+    snprintf(side, sizeof(side), "%s%s", path, extension);
+    if (SdMan.exists(side) && !SdMan.remove(side)) return false;
+  }
+  char sibling[192];
+  snprintf(sibling, sizeof(sibling), "%s", path);
+  char* dot = strrchr(sibling, '.');
+  snprintf(dot, sizeof(sibling) - size_t(dot - sibling), ".epub");
+  if (SdMan.exists(sibling)) handoffEpubPosition(sibling, path);
+  return true;
+}
+#endif
+
 void FileTransferServer::handleUploadDone() {
+#if defined(FLOWE_BENCH_UPLOAD_PROFILE)
+  UploadDuration duration(_uploadProfile.responseUs);
+  ++_uploadProfile.responseCalls;
+#endif
+  transferMemoryProbe("upload-response", _upload.received);
   Serial.printf("[xphone-os] transfer: upload done heap=%u largest=%u\n", ESP.getFreeHeap(),
                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
   _requestCount++;
@@ -946,13 +1928,21 @@ void FileTransferServer::handleManifest() {
   _requestCount++;
   _server->setContentLength(CONTENT_LENGTH_UNKNOWN);
   _server->send(200, "application/json", "");
-  _server->sendContent("{\"books\":[");
+  // The synchronous server cannot upload while it builds a manifest. Reuse
+  // its reserved buffer rather than add another heap or task-stack buffer.
+  static_assert(UploadState::kBufferSize >= HttpResponseBatch::kStorageSize);
+  NetworkClient client = _server->client();
+  HttpResponseBatch batch(_upload.buffer, _server->version() != "HTTP/1.0",
+      [](void* context, const uint8_t* bytes, size_t length) {
+        return static_cast<NetworkClient*>(context)->write(bytes, length);
+      }, &client);
+  bool alive = batch.append("{\"books\":[");
 
   bool first = true;
   char rel[192];
-  const auto emitDir = [&](const char* dir, const char* prefix) {
+  const auto emitDir = [&](const char* dir, const char* prefix) -> bool {
     FsFile d = SdMan.open(dir, O_RDONLY);
-    if (!d || !d.isDir()) return;
+    if (!d || !d.isDir()) return true;
     FsFile f;
     while (f.openNext(&d, O_RDONLY)) {
       esp_task_wdt_reset();
@@ -987,19 +1977,20 @@ void FileTransferServer::handleManifest() {
       snprintf(tail, sizeof(tail), "\",\"size\":%lu,\"md5h\":\"%s\"}",
                static_cast<unsigned long>(size), md5.toString().c_str());
       row += tail;
-      _server->sendContent(row);
+      if (!batch.append(row.c_str(), row.length())) { d.close(); return false; }
       first = false;
     }
     d.close();
+    return true;
   };
 
-  emitDir("/books", "");
+  if (alive) alive = emitDir("/books", "");
   // One subdir level, same rule as the shelf.
-  {
+  if (alive) {
     FsFile d = SdMan.open("/books", O_RDONLY);
     if (d && d.isDir()) {
       FsFile f;
-      while (f.openNext(&d, O_RDONLY)) {
+      while (alive && f.openNext(&d, O_RDONLY)) {
         char name[128];
         const int len = f.getName(name, sizeof(name));
         const bool usable = len > 0 && len < static_cast<int>(sizeof(name)) - 1 && name[0] != '.' && f.isDir();
@@ -1008,28 +1999,28 @@ void FileTransferServer::handleManifest() {
         char sub[160], prefix[144];
         if (snprintf(sub, sizeof(sub), "/books/%s", name) >= static_cast<int>(sizeof(sub))) continue;
         snprintf(prefix, sizeof(prefix), "%s/", name);
-        emitDir(sub, prefix);
+        alive = emitDir(sub, prefix);
       }
       d.close();
     }
   }
 
-  _server->sendContent("],\"tombstones\":[");
+  if (alive) alive = batch.append("],\"tombstones\":[");
   first = true;
-  {
+  if (alive) {
     FsFile t = SdMan.open(kTombstonePath, O_RDONLY);
     if (t) {
       char line[192];
       size_t pos = 0;
       int c;
-      while ((c = t.read()) >= 0) {
+      while (alive && (c = t.read()) >= 0) {
         if (c == '\n' || pos >= sizeof(line) - 1) {
           line[pos] = 0;
           if (pos > 0) {
             String row = first ? "\"" : ",\"";
             appendEscaped(row, line);
             row += '"';
-            _server->sendContent(row);
+            alive = batch.append(row.c_str(), row.length());
             first = false;
           }
           pos = 0;
@@ -1040,6 +2031,11 @@ void FileTransferServer::handleManifest() {
       t.close();
     }
   }
-  _server->sendContent("]}");
-  _server->sendContent("");  // terminate chunked response
+  if (alive) alive = batch.append("]}") && batch.flush();
+  if (alive) {
+    _server->sendContent("");  // Framework owns the final chunk and its state.
+  } else {
+    Serial.println("[xphone-os] transfer: manifest: client stopped taking bytes; dropping it");
+    client.stop();
+  }
 }

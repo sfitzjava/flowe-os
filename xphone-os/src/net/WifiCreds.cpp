@@ -346,6 +346,28 @@ bool takeFailure(char* ssid, const size_t ssidSize, int* reason) {
   return true;
 }
 
+bool readerId(char* out, const size_t outSize) {
+  if (!out || !outSize) return false;
+  out[0] = '\0';
+  if (outSize < kReaderIdSize) return false;
+  uint8_t mac[6] = {0};
+  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) return false;
+  snprintf(out, outSize, "%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return true;
+}
+
+bool apBssid(char* out, const size_t outSize) {
+  if (!out || !outSize) return false;
+  out[0] = '\0';
+  if (outSize < 18) return false;
+  uint8_t mac[6] = {0};
+  if (esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP) != ESP_OK) return false;
+  snprintf(out, outSize, "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return true;
+}
+
 void apCredentials(char* ssid, const size_t ssidSize, char* pass, const size_t passSize) {
   if (ssid && ssidSize) ssid[0] = '\0';
   if (pass && passSize) pass[0] = '\0';

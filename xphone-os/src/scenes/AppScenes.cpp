@@ -122,8 +122,12 @@ void showFileTransferAutoStartDirect() {
 void showFileTransferAutoStartInPlace(const bool direct) {
   const SceneId from = gCurrentSceneId;
   if (G_GFX) SCENES.composeActive(*G_GFX);  // the framebuffer = what is on glass, before the reader lets go
+  const Gfx::Orient orientation = G_GFX ? G_GFX->orientation() : Gfx::Orient::Portrait;
   gCurrentSceneId = SceneId::FileTransfer;
   SCENES.switchTo(gFileTransfer);  // the reader's onExit frees the book; the picture stays
+  // ReaderScene::onExit restores portrait for normal scene changes. This
+  // scene keeps its picture, so the bar must use that picture's orientation.
+  if (G_GFX) G_GFX->setOrientation(orientation);
   gFileTransfer.beginSilent(static_cast<uint32_t>(from));
   if (direct) gFileTransfer.autoStartDirect();
   else gFileTransfer.autoStart();

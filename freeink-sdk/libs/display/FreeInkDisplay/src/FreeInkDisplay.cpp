@@ -7,7 +7,7 @@
 #include <fstream>
 #include <vector>
 #endif
-#if FREEINK_FB_PSRAM
+#if FREEINK_FB_PSRAM || FREEINK_FB_RELEASABLE
 #include <cstdlib>
 
 #include "esp_heap_caps.h"
@@ -175,8 +175,12 @@ void FreeInkDisplay::begin() {
 #endif
 #endif
 
+#if FREEINK_FB_RELEASABLE
+  if (frameBuffer0 && frameBufferAllocatedSize != bufferSize) releaseFramebufferForSync();
+  restoreFramebufferAfterSync();
+#endif
   frameBuffer = frameBuffer0;
-#if FREEINK_FB_PSRAM
+#if FREEINK_FB_PSRAM || FREEINK_FB_RELEASABLE
   if (frameBuffer0)  // guard against an allocation failure (OOM); the #if keeps the
 #endif               // static-array build free of a -Waddress always-true warning
     memset(frameBuffer0, 0xFF, bufferSize);
@@ -191,11 +195,39 @@ void FreeInkDisplay::begin() {
   _driver->begin(_bus);
 }
 
+bool FreeInkDisplay::releaseFramebufferForSync() {
+#if FREEINK_FB_RELEASABLE
+  if (!frameBuffer0 || frameBuffer != frameBuffer0) return false;
+  uint8_t* owned = frameBuffer0;
+  frameBuffer = nullptr;
+  frameBuffer0 = nullptr;
+  frameBufferAllocatedSize = 0;
+  heap_caps_free(owned);
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool FreeInkDisplay::restoreFramebufferAfterSync() {
+#if FREEINK_FB_RELEASABLE
+  if (!frameBuffer0) {
+    frameBuffer0 = static_cast<uint8_t*>(heap_caps_malloc(
+        bufferSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+    if (!frameBuffer0) return false;
+    frameBufferAllocatedSize = bufferSize;
+    memset(frameBuffer0, 0xFF, bufferSize);
+  }
+  frameBuffer = frameBuffer0;
+#endif
+  return frameBuffer != nullptr;
+}
+
 // ============================================================================
 // Framebuffer composition (facade-owned; no driver involvement)
 // ============================================================================
 
-void FreeInkDisplay::clearScreen(uint8_t color) const { memset(frameBuffer, color, bufferSize); }
+void FreeInkDisplay::clearScreen(uint8_t color) const { if (frameBuffer) memset(frameBuffer, color, bufferSize); }
 
 void FreeInkDisplay::drawImage(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                                bool fromProgmem) const {
@@ -231,7 +263,7 @@ void FreeInkDisplay::drawImageTransparent(const uint8_t* imageData, uint16_t x, 
   }
 }
 
-void FreeInkDisplay::setFramebuffer(const uint8_t* bwBuffer) const { memcpy(frameBuffer, bwBuffer, bufferSize); }
+void FreeInkDisplay::setFramebuffer(const uint8_t* bwBuffer) const { if (frameBuffer && bwBuffer) memcpy(frameBuffer, bwBuffer, bufferSize); }
 
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
 void FreeInkDisplay::swapBuffers() {
@@ -246,6 +278,7 @@ void FreeInkDisplay::swapBuffers() {
 // ============================================================================
 
 void FreeInkDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen) {
+  if (!frameBuffer) return;
 #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
   Serial.printf("[EPD] displayBuffer mode=%d off=%d\n", (int)mode, (int)turnOffScreen);
 #endif
@@ -258,6 +291,7 @@ void FreeInkDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen) {
 }
 
 void FreeInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen) {
+  if (!frameBuffer) return;
 #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
   Serial.printf("[EPD] displayWindow %u,%u %ux%u\n", x, y, w, h);
 #endif
@@ -269,10 +303,12 @@ void FreeInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t 
 }
 
 void FreeInkDisplay::displayWindowFlash(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  if (!frameBuffer) return;
   _driver->displayWindowFlash(_bus, frameBuffer, x, y, w, h);
 }
 
 void FreeInkDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* lut, bool factoryMode) {
+  if (!frameBuffer) return;
 #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
   Serial.printf("[EPD] displayGrayBuffer\n");
 #endif
@@ -282,28 +318,39 @@ void FreeInkDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* 
 void FreeInkDisplay::refreshDisplay(RefreshMode mode, bool turnOffScreen) { displayBuffer(mode, turnOffScreen); }
 
 void FreeInkDisplay::copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* msbBuffer) {
+  if (!frameBuffer) return;
   _driver->copyGrayscaleLsb(_bus, lsbBuffer);
   _driver->copyGrayscaleMsb(_bus, msbBuffer);
 }
 
 void FreeInkDisplay::displayGrayscaleBase(RefreshMode fallback, bool turnOffScreen) {
+  if (!frameBuffer) return;
   _driver->displayGrayscaleBase(_bus, frameBuffer, toInternal(fallback), turnOffScreen);
 }
 
 void FreeInkDisplay::preconditionGrayscale() {
+  if (!frameBuffer) return;
   _driver->preconditionGrayscale(_bus, 0, 0, getDisplayWidth(), getDisplayHeight());
 }
 
 void FreeInkDisplay::preconditionGrayscale(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  if (!frameBuffer) return;
   _driver->preconditionGrayscale(_bus, x, y, w, h);
 }
 
-void FreeInkDisplay::copyGrayscaleLsbBuffers(const uint8_t* lsbBuffer) { _driver->copyGrayscaleLsb(_bus, lsbBuffer); }
+void FreeInkDisplay::copyGrayscaleLsbBuffers(const uint8_t* lsbBuffer) {
+  if (!frameBuffer) return;
+  _driver->copyGrayscaleLsb(_bus, lsbBuffer);
+}
 
-void FreeInkDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { _driver->copyGrayscaleMsb(_bus, msbBuffer); }
+void FreeInkDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) {
+  if (!frameBuffer) return;
+  _driver->copyGrayscaleMsb(_bus, msbBuffer);
+}
 
 void FreeInkDisplay::writeGrayscalePlaneStrip(GrayPlane plane, const uint8_t* rows, uint16_t yStart,
                                               uint16_t numRows) {
+  if (!frameBuffer) return;
   _driver->writeGrayscalePlaneStrip(_bus, plane == GRAY_PLANE_LSB ? freeink::GrayPlane::Lsb : freeink::GrayPlane::Msb,
                                     rows, yStart, numRows);
 }
@@ -312,6 +359,7 @@ bool FreeInkDisplay::supportsStripGrayscale() const { return _driver && _driver-
 
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
 void FreeInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
+  if (!frameBuffer) return;
   _driver->cleanupGrayscaleBuffers(_bus, bwBuffer);
 }
 #endif
@@ -337,6 +385,7 @@ uint16_t FreeInkDisplay::fastRefreshCutoffMs() const {
 }
 
 void FreeInkDisplay::grayscaleRevert() {
+  if (!frameBuffer) return;
   if (_driver) _driver->grayscaleRevert(_bus, frameBuffer);
 }
 
@@ -367,6 +416,7 @@ void FreeInkDisplay::deepSleep() {
 void FreeInkDisplay::saveFrameBufferAsPBM(const char* filename) {
 #ifndef ARDUINO
   const uint8_t* buffer = getFrameBuffer();
+  if (!buffer) return;
   std::ofstream file(filename, std::ios::binary);
   if (!file) return;
 

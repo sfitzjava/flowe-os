@@ -18,6 +18,7 @@
 // attribution rather than inventing dates.
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 
 namespace reader {
@@ -78,6 +79,10 @@ class ReadingStats {
 
   // Whole store as JSON for the transfer server's /stats endpoint.
   static std::string toJson();
+  // Emit complete JSON fragments without allocating the whole report.
+  // Stop as soon as the receiver refuses a fragment.
+  using JsonSink = bool (*)(const char*, size_t, void*);
+  static bool writeJson(JsonSink sink, void* context);
 
   // Erase everything recorded — the day ring, the book table, and any open
   // session's accumulated pages/time (flowe-os#44). An open session keeps

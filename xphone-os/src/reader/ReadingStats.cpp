@@ -397,27 +397,35 @@ ReadingStats::Band ReadingStats::band() {
 }
 
 std::string ReadingStats::toJson() {
-  load();
-  const Band b = band();
   std::string out;
   out.reserve(1024);
+  writeJson([](const char* bytes, size_t length, void* context) {
+    static_cast<std::string*>(context)->append(bytes, length);
+    return true;
+  }, &out);
+  return out;
+}
+
+bool ReadingStats::writeJson(JsonSink sink, void* context) {
+  load();
+  const Band b = band();
   // A v2 book line peaks at 106 chars (10-digit hash, 5-digit counters,
   // 8-digit dates). 96 truncated the closing brace and every phone-side
   // decode of reader.progress failed. Caught on hardware, 2026-08-18.
   char buf[128];
   snprintf(buf, sizeof(buf), "{\"clockValid\":%s,\"streak\":%u,\"todayPages\":%u,\"days\":[",
            b.clockValid ? "true" : "false", b.streakDays, b.todayPages);
-  out += buf;
+  if (!sink(buf, strlen(buf), context)) return false;
   bool first = true;
   for (int i = 0; i < kDays; i++) {
     const DayRec& d = s_store.days[i];
     if (d.day == 0) continue;
     snprintf(buf, sizeof(buf), "%s{\"day\":%u,\"pages\":%u,\"minutes\":%u}", first ? "" : ",",
              d.day, d.pages, d.minutes);
-    out += buf;
+    if (!sink(buf, strlen(buf), context)) return false;
     first = false;
   }
-  out += "],\"books\":[";
+  if (!sink("],\"books\":[", 11, context)) return false;
   first = true;
   for (int i = 0; i < kBooks; i++) {
     const BookRec& r = s_store.books[i];
@@ -426,11 +434,10 @@ std::string ReadingStats::toJson() {
              "%s{\"hash\":%u,\"pages\":%u,\"minutes\":%u,\"lastDay\":%u,\"firstDay\":%u,"
              "\"daysRead\":%u}",
              first ? "" : ",", r.hash, r.pages, r.minutes, r.lastDay, r.firstDay, r.daysRead);
-    out += buf;
+    if (!sink(buf, strlen(buf), context)) return false;
     first = false;
   }
-  out += "]}";
-  return out;
+  return sink("]}", 2, context);
 }
 
 }  // namespace reader

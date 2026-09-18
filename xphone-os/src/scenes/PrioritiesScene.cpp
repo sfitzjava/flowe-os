@@ -363,12 +363,12 @@ void PrioritiesScene::render(Gfx& gfx) {
 // Static: reads the priorities store directly, shares the checkbox/truncation
 // helpers with render(). Calm composition: centered title + rule, tallies,
 // single-line rows (notes omitted — undone bold, done regular + ticked), and
-// a bottom "moon + xphone" stamp with the wake hint. No RTC on X3/X4, so no
+// a bottom Flowe sun stamp with the wake hint. No RTC on X3/X4, so no
 // "synced Xm ago" line.
 // The wake hint, one centred line at the foot of every sleep poster: a
-// crescent and "napping" for the light rest, a full disc and "asleep" for
-// off (that page is inverted afterwards, so the disc reads as a full moon
-// on black). It sits at h-56; the list ends at h-176, the calendar and
+// crescent and "napping" for the light rest, a larger crescent and bold
+// "asleep" for deep sleep. Both use the same white background.
+// It sits at h-56; the list ends at h-176, the calendar and
 // block lines use h-108 and h-148, so it never meets them, at ten
 // priorities or a hundred.
 // Crescent moon for the dormant stamp: full disc, then a white disc offset
@@ -382,13 +382,14 @@ void PrioritiesScene::renderDormantWakeHint(Gfx& gfx, const bool napping) {
   const int cx = gfx.width() / 2;
   const int y = gfx.height() - 56;
   const char* text = napping ? "napping: press power to wake" : "asleep: press power to wake";
-  constexpr int kD = 16, kGap = 8;
-  const int tw = gfx.textWidth(kFontSmall, text);
+  const XpFont& font = napping ? kFontSmall : kFontBold;
+  const int kD = napping ? 16 : 32;
+  const int kGap = napping ? 8 : 12;
+  const int tw = gfx.textWidth(font, text);
   const int gx = cx - (kD + kGap + tw) / 2;
-  const int gy = y + (gfx.lineHeight(kFontSmall) - kD) / 2;
-  if (napping) drawMoon(gfx, gx, gy, kD);
-  else gfx.fillRoundedRect(gx, gy, kD, kD, kD / 2, true);
-  gfx.drawText(kFontSmall, gx + kD + kGap, y, text);
+  const int gy = y + (gfx.lineHeight(font) - kD) / 2;
+  drawMoon(gfx, gx, gy, kD);
+  gfx.drawText(font, gx + kD + kGap, y, text);
 }
 
 bool PrioritiesScene::renderDormant(Gfx& gfx, const bool napping) {
@@ -446,7 +447,7 @@ bool PrioritiesScene::renderDormant(Gfx& gfx, const bool napping) {
   // position as the plain sleep screen's hint). During an active block the
   // stamp becomes a padlock + "Block active until <time>" (falling back to a
   // minutes-left line when the phone omits the end-time label); otherwise it
-  // stays the calm crescent + "xphone" wordmark.
+  // shows the Flowe sun and wordmark.
   // Footer stack (centered): calendar line, block line beneath it, wake hint
   // last. Either line slides into the lower slot when the other is absent.
   int slotY = h - 108;
@@ -454,13 +455,7 @@ bool PrioritiesScene::renderDormant(Gfx& gfx, const bool napping) {
   if (blockDrawn) slotY = h - 148;
   const bool calDrawn = renderDormantFooter(gfx, slotY);
   if (!blockDrawn && !calDrawn) {
-    // Nothing to say: the calm crescent + wordmark.
-    const int gap = 12;
-    const char* kWordmark = "flowe";
-    const int moonD = 22;
-    const int gx = cx - (moonD + gap + gfx.textWidth(kFontBold, kWordmark)) / 2;
-    drawMoon(gfx, gx, h - 108 + (gfx.lineHeight(kFontBold) - moonD) / 2, moonD);
-    gfx.drawText(kFontBold, gx + moonD + gap, h - 108, kWordmark);
+    StatusBar::drawFloweStamp(gfx, cx, h - 108);
   }
   renderDormantWakeHint(gfx, napping);
   return true;
