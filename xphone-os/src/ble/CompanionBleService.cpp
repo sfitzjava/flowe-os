@@ -2596,7 +2596,7 @@ void CompanionBleService::sendDeviceInfo() {
   std::snprintf(json, sizeof(json),
                 "{\"schemaVersion\":1,\"type\":\"device.info\",\"version\":\"%s\",\"gitRev\":\"%s\","
                 "\"device\":\"%s\",\"slot\":\"%s\",\"otaPending\":%s}",
-                XPHONE_VERSION, XPHONE_GIT_REV_STR, gDeviceIsX3 ? "x3" : "x4",
+                XPHONE_VERSION, XPHONE_GIT_REV_STR, deviceKindLower(),
                 running ? running->label : "?", sd_update::otaPending() ? "true" : "false");
   actionCharacteristic->setValue(json);
   notifyAction();

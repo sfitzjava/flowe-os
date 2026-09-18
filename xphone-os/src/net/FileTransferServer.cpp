@@ -13,6 +13,7 @@
 #endif
 
 #include "../StallWatch.h"
+#include "../DeviceKind.h"
 #if defined(FLOWE_BENCH_TRANSFER_FLUSH_BARRIER)
 #include "../Scene.h"
 #endif
@@ -677,10 +678,7 @@ void FileTransferServer::handleStatus() {
   JsonDocument doc;
   doc["sessionVerified"] = authorization.sessionVerified;
   if (haveReaderId) doc["readerId"] = readerId;
-  {
-    extern bool gDeviceIsX3;  // DeviceKind.h; set at boot
-    doc["device"] = gDeviceIsX3 ? "X3" : "X4";
-  }
+  doc["device"] = deviceKindUpper();
   doc["version"] = XPHONE_VERSION;
   if (verified) doc["downloadRangeVersion"] = 1;
 #if defined(FLOWE_RAW_UPLOAD)

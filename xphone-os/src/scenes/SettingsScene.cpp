@@ -397,7 +397,7 @@ void SettingsScene::renderMenu(Gfx& gfx) {
   // Footer: firmware version + build env, bottom of the content area
   // (mirrors CrossPoint showing CROSSPOINT_VERSION in the settings header).
   char footer[64];
-  snprintf(footer, sizeof(footer), "xphone-os %s (%s)", XPHONE_VERSION, gDeviceIsX3 ? "x3" : "x4");
+  snprintf(footer, sizeof(footer), "xphone-os %s (%s)", XPHONE_VERSION, deviceKindUpper());
   const int footY = gfx.height() - Scene::SOFTKEY_BAR_H - gfx.lineHeight(kFontRegular) - 6;
   gfx.drawTextCentered(kFontRegular, gfx.width() / 2, footY, footer);
 }
