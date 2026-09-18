@@ -153,6 +153,7 @@ void quietRestartToScene(uint32_t sceneId) {
                 static_cast<unsigned long>(sceneId), ESP.getFreeHeap(),
                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
   Sleep::armRestoreScene(sceneId);
+  Sleep::persistStoresForRestart();  // the boot re-seeds THESE lists, not the last power-off's
   SCENES.waitFlushIdle();
   input.suspendTask();
   armBenchQuietWake();
@@ -961,6 +962,7 @@ static void enterNap(const char* why) {
   // host's reattach resets the chip (five reboots on the bench, 2026-09-06).
   // On a charger without a host nothing changes.
   gNapOnUsb = usbHostConnected();
+  Sleep::requestFreshCardsNow();  // a connected phone refreshes the lists before the poster (2026-09-17)
   Sleep::drawSleepScreenNow(gfx, /*napping=*/true);
   SCENES.setPaused(true);  // nothing paints over the sleep screen (the link dot, cards)
   snapshotNapRevisions();
@@ -2543,6 +2545,11 @@ static void pumpDevConsole() {
       if (line[0] == 'n') gNapAfterMsOverride = s; else gOffAfterMsOverride = s;
       Serial.printf("[xphone-os] devcon: %s %lu ms\n", line[0] == 'n' ? "napafter" : "offafter", (unsigned long)s);
       continue;
+    }
+    if (!strcmp(line, "quietrestart")) {
+      // Bench: the restart that ends a sync, on the current scene.
+      Serial.println("[xphone-os] devcon: quietrestart");
+      quietRestartToScene(static_cast<uint32_t>(gCurrentSceneId));
     }
     if (!strcmp(line, "wakeboot")) {
       // Bench: restart as if waking from deep sleep (no splash), leaving the

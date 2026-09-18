@@ -85,6 +85,19 @@ void imuSleepAtBoot();
 // (draws with gfx, waits on input for the power-button release).
 [[noreturn]] void sleepNow(Gfx& gfx, Input& input);
 
+// Write the companion stores (Today, Priorities, Workout, notifications) to
+// NVS now, so a restart re-seeds the CURRENT lists. sleepNow does this on the
+// way to OFF; the quiet restart (main.cpp quietRestartToScene) must do it too,
+// or the boot re-seeds whatever the last power-off left (2026-09-17).
+void persistStoresForRestart();
+
+// Ask a connected phone for fresh Priorities and Today snapshots and wait a
+// short moment for each (about 300 ms; returns at once when the phone is not
+// connected). sleepNow calls it before the OFF poster; the nap entry calls it
+// before the nap poster for the same reason: the poster is only as fresh as
+// the store, and a restart since the last push may have left it stale.
+void requestFreshCardsNow();
+
 /// The sleep screen, composed at full CPU speed. Used by
 /// the nap (screen off, link kept) and by sleepNow on the way to deep sleep.
 /// `napping`: the device is only resting (Bluetooth on, a press brings the
